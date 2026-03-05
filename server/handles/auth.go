@@ -88,22 +88,37 @@ func loginHash(c *gin.Context, req *LoginReq) {
 }
 
 type UserResp struct {
-	ID         uint   `json:"id"`
-	Username   string `json:"username"`
-	Password   string `json:"password"`
-	BasePath   string `json:"base_path"`
-	Role       []int  `json:"role"`
-	RoleID     int    `json:"role_id"`
-	Disabled   bool   `json:"disabled"`
+	ID          uint                 `json:"id"`
+	Username    string               `json:"username"`
+	Password    string               `json:"password"`
+	BasePath    string               `json:"base_path"`
+	Role        []int                `json:"role"`
+	RoleID      int                  `json:"role_id"`
+	Disabled    bool                 `json:"disabled"`
+	Permission  int32                `json:"permission"`
+	Permissions []UserPathPermission `json:"permissions"`
+	SsoID       string               `json:"sso_id"`
+	Otp         bool                 `json:"otp"`
+}
+
+type UserPathPermission struct {
+	Path       string `json:"path"`
 	Permission int32  `json:"permission"`
-	SsoID      string `json:"sso_id"`
-	Otp        bool   `json:"otp"`
 }
 
 // CurrentUser get current user by token
 // if token is empty, return guest user
 func CurrentUser(c *gin.Context) {
 	user := c.MustGet("user").(*model.User)
+	permPath := user.BasePath
+	if permPath == "" || user.IsAdmin() {
+		permPath = "/"
+	}
+	permValue := user.Permission
+	// Keep frontend permission checks simple for admin.
+	if user.IsAdmin() {
+		permValue = (1 << 10) - 1
+	}
 	userResp := UserResp{
 		ID:         user.ID,
 		Username:   user.Username,
@@ -113,7 +128,13 @@ func CurrentUser(c *gin.Context) {
 		RoleID:     user.Role,
 		Disabled:   user.Disabled,
 		Permission: user.Permission,
-		SsoID:      user.SsoID,
+		Permissions: []UserPathPermission{
+			{
+				Path:       permPath,
+				Permission: permValue,
+			},
+		},
+		SsoID: user.SsoID,
 	}
 	if user.OtpSecret != "" {
 		userResp.Otp = true
