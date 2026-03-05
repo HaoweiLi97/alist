@@ -41,6 +41,14 @@
 
 English | [中文](./README_cn.md)| [日本語](./README_ja.md) | [Contributing](./CONTRIBUTING.md) | [CODE_OF_CONDUCT](./CODE_OF_CONDUCT.md)
 
+## Fork Notice
+
+This repository is a fork based on AList `v3.40`.
+
+### Custom updates
+
+- Accelerated single-file cloud drive direct-link retrieval.
+
 ## Features
 
 - [x] Multiple storages

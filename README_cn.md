@@ -41,6 +41,14 @@
 
 [English](./README.md) | 中文 | [日本語](./README_ja.md) | [Contributing](./CONTRIBUTING.md) | [CODE_OF_CONDUCT](./CODE_OF_CONDUCT.md)
 
+## Fork 说明
+
+本仓库是基于 AList `v3.40` 的 Fork 版本。
+
+### 自定义更新
+
+- 加速单文件网盘直链获取。
+
 ## 功能
 
 - [x] 多种存储
