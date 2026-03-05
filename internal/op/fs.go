@@ -21,6 +21,10 @@ import (
 var listCache = cache.NewMemCache(cache.WithShards[[]model.Obj](64))
 var listG singleflight.Group[[]model.Obj]
 
+type GetArgs struct {
+	Refresh bool
+}
+
 func updateCacheObj(storage driver.Driver, path string, oldObj model.Obj, newObj model.Obj) {
 	key := Key(storage, path)
 	objs, ok := listCache.Get(key)
@@ -161,6 +165,10 @@ func List(ctx context.Context, storage driver.Driver, path string, args model.Li
 
 // Get object from list of files
 func Get(ctx context.Context, storage driver.Driver, path string) (model.Obj, error) {
+	return GetWithArgs(ctx, storage, path, GetArgs{})
+}
+
+func GetWithArgs(ctx context.Context, storage driver.Driver, path string, args GetArgs) (model.Obj, error) {
 	path = utils.FixAndCleanPath(path)
 	log.Debugf("op.Get %s", path)
 
@@ -214,7 +222,7 @@ func Get(ctx context.Context, storage driver.Driver, path string) (model.Obj, er
 
 	// not root folder
 	dir, name := stdpath.Split(path)
-	files, err := List(ctx, storage, dir, model.ListArgs{})
+	files, err := List(ctx, storage, dir, model.ListArgs{Refresh: args.Refresh})
 	if err != nil {
 		return nil, errors.WithMessage(err, "failed get parent list")
 	}

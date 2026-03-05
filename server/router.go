@@ -74,6 +74,11 @@ func Init(e *gin.Engine) {
 	public := api.Group("/public")
 	public.Any("/settings", handles.PublicSettings)
 	public.Any("/offline_download_tools", handles.OfflineDownloadTools)
+	public.Any("/archive_extensions", handles.ArchiveExtensions)
+	// compatibility for older frontend builds that request /public/* directly
+	g.Any("/public/settings", handles.PublicSettings)
+	g.Any("/public/offline_download_tools", handles.OfflineDownloadTools)
+	g.Any("/public/archive_extensions", handles.ArchiveExtensions)
 
 	_fs(auth.Group("/fs"))
 	_task(auth.Group("/task", middlewares.AuthNotGuest))

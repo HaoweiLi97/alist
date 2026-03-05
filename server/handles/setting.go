@@ -103,3 +103,8 @@ func DeleteSetting(c *gin.Context) {
 func PublicSettings(c *gin.Context) {
 	common.SuccessResp(c, op.GetPublicSettingsMap())
 }
+
+func ArchiveExtensions(c *gin.Context) {
+	// Keep this endpoint for frontend compatibility. Empty means use frontend defaults.
+	common.SuccessResp(c, []string{})
+}

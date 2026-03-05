@@ -88,8 +88,16 @@ func loginHash(c *gin.Context, req *LoginReq) {
 }
 
 type UserResp struct {
-	model.User
-	Otp bool `json:"otp"`
+	ID         uint   `json:"id"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	BasePath   string `json:"base_path"`
+	Role       []int  `json:"role"`
+	RoleID     int    `json:"role_id"`
+	Disabled   bool   `json:"disabled"`
+	Permission int32  `json:"permission"`
+	SsoID      string `json:"sso_id"`
+	Otp        bool   `json:"otp"`
 }
 
 // CurrentUser get current user by token
@@ -97,10 +105,17 @@ type UserResp struct {
 func CurrentUser(c *gin.Context) {
 	user := c.MustGet("user").(*model.User)
 	userResp := UserResp{
-		User: *user,
+		ID:         user.ID,
+		Username:   user.Username,
+		Password:   "",
+		BasePath:   user.BasePath,
+		Role:       []int{user.Role},
+		RoleID:     user.Role,
+		Disabled:   user.Disabled,
+		Permission: user.Permission,
+		SsoID:      user.SsoID,
 	}
-	userResp.Password = ""
-	if userResp.OtpSecret != "" {
+	if user.OtpSecret != "" {
 		userResp.Otp = true
 	}
 	common.SuccessResp(c, userResp)

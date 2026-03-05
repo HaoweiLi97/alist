@@ -228,6 +228,7 @@ func toObjsResp(objs []model.Obj, parent string, encrypt bool) []ObjResp {
 type FsGetReq struct {
 	Path     string `json:"path" form:"path"`
 	Password string `json:"password" form:"password"`
+	Refresh  bool   `json:"refresh" form:"refresh"`
 }
 
 type FsGetResp struct {
@@ -263,7 +264,7 @@ func FsGet(c *gin.Context) {
 		common.ErrorStrResp(c, "password is incorrect or you have no permission", 403)
 		return
 	}
-	obj, err := fs.Get(c, reqPath, &fs.GetArgs{})
+	obj, err := fs.Get(c, reqPath, &fs.GetArgs{Refresh: req.Refresh})
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return

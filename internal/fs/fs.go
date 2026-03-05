@@ -30,11 +30,15 @@ func List(ctx context.Context, path string, args *ListArgs) ([]model.Obj, error)
 }
 
 type GetArgs struct {
-	NoLog bool
+	Refresh bool
+	NoLog   bool
 }
 
 func Get(ctx context.Context, path string, args *GetArgs) (model.Obj, error) {
-	res, err := get(ctx, path)
+	if args == nil {
+		args = &GetArgs{}
+	}
+	res, err := get(ctx, path, args)
 	if err != nil {
 		if !args.NoLog {
 			log.Warnf("failed get %s: %s", path, err)

@@ -11,7 +11,10 @@ import (
 	"github.com/pkg/errors"
 )
 
-func get(ctx context.Context, path string) (model.Obj, error) {
+func get(ctx context.Context, path string, args *GetArgs) (model.Obj, error) {
+	if args == nil {
+		args = &GetArgs{}
+	}
 	path = utils.FixAndCleanPath(path)
 	// maybe a virtual file
 	if path != "/" {
@@ -35,5 +38,7 @@ func get(ctx context.Context, path string) (model.Obj, error) {
 		}
 		return nil, errors.WithMessage(err, "failed get storage")
 	}
-	return op.Get(ctx, storage, actualPath)
+	return op.GetWithArgs(ctx, storage, actualPath, op.GetArgs{
+		Refresh: args.Refresh,
+	})
 }
