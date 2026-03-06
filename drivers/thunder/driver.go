@@ -4,13 +4,17 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	stdpath "path"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/pkg/singleflight"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	hash_extend "github.com/alist-org/alist/v3/pkg/utils/hash"
 	"github.com/aws/aws-sdk-go/aws"
@@ -18,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 type Thunder struct {
@@ -234,10 +239,102 @@ type XunLeiCommon struct {
 	*TokenResp // 登录信息
 
 	refreshTokenFunc func() error
+	pathIDCache      sync.Map // cleaned full path -> file id
+	getObjCache      sync.Map // cleaned full path -> cachedObj
+	getObjG          singleflight.Group[model.Obj]
 }
 
+type cachedObj struct {
+	obj       model.Obj
+	expiresAt int64
+}
+
+const getObjCacheTTL = 15 * time.Second
+
 func (xc *XunLeiCommon) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	return xc.getFiles(ctx, dir.GetID())
+	files, err := xc.getFiles(ctx, dir.GetID())
+	if err != nil {
+		return nil, err
+	}
+	reqPath := utils.FixAndCleanPath(args.ReqPath)
+	if reqPath != "" {
+		xc.cachePathID(reqPath, dir.GetID())
+		for _, obj := range files {
+			xc.cachePathID(stdpath.Join(reqPath, obj.GetName()), obj.GetID())
+		}
+	}
+	return files, nil
+}
+
+func (xc *XunLeiCommon) Get(ctx context.Context, path string) (model.Obj, error) {
+	cleanPath := utils.FixAndCleanPath(path)
+	if cleanPath == "/" {
+		return &model.Object{
+			Name:     "root",
+			Size:     0,
+			Modified: time.Time{},
+			IsFolder: true,
+		}, nil
+	}
+
+	if cached, ok := xc.loadCachedObj(cleanPath); ok {
+		log.Debugf("[thunder.get] obj-cache-hit path=%s", cleanPath)
+		return cached, nil
+	}
+
+	obj, err, shared := xc.getObjG.Do(cleanPath, func() (model.Obj, error) {
+		if cached, ok := xc.loadCachedObj(cleanPath); ok {
+			return cached, nil
+		}
+		resolved, resolveErr := xc.getNoSingleflight(ctx, cleanPath)
+		if resolveErr == nil {
+			xc.storeCachedObj(cleanPath, resolved)
+		}
+		return resolved, resolveErr
+	})
+	if shared {
+		log.Debugf("[thunder.get] singleflight-shared path=%s", cleanPath)
+	}
+	return obj, err
+}
+
+func (xc *XunLeiCommon) getNoSingleflight(ctx context.Context, cleanPath string) (model.Obj, error) {
+
+	// Fast path: if we already know file id for this path, fetch by id directly.
+	if fileID, ok := xc.loadPathID(cleanPath); ok && fileID != "" {
+		log.Debugf("[thunder.get] cache-hit path=%s id=%s", cleanPath, fileID)
+		if obj, err := xc.getByID(ctx, fileID); err == nil {
+			log.Debugf("[thunder.get] by-id success path=%s", cleanPath)
+			xc.storeCachedObj(cleanPath, obj)
+			return obj, nil
+		}
+		log.Debugf("[thunder.get] by-id failed, fallback list path=%s", cleanPath)
+	}
+
+	parentPath, base := stdpath.Split(cleanPath)
+	parentPath = utils.FixAndCleanPath(parentPath)
+	parentID, err := xc.resolveDirIDByPath(ctx, parentPath)
+	if err != nil {
+		return nil, err
+	}
+
+	children, err := xc.getFiles(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("[thunder.get] fallback-list parent=%s", parentPath)
+	for _, child := range children {
+		if child.GetName() != base {
+			continue
+		}
+		xc.cachePathID(cleanPath, child.GetID())
+		if child.IsDir() {
+			xc.cachePathID(stdpath.Join(parentPath, child.GetName()), child.GetID())
+		}
+		xc.storeCachedObj(cleanPath, child)
+		return child, nil
+	}
+	return nil, errs.ObjectNotFound
 }
 
 func (xc *XunLeiCommon) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
@@ -421,6 +518,105 @@ func (xc *XunLeiCommon) getFiles(ctx context.Context, folderId string) ([]model.
 		pageToken = fileList.NextPageToken
 	}
 	return files, nil
+}
+
+func (xc *XunLeiCommon) getByID(ctx context.Context, fileID string) (model.Obj, error) {
+	var f Files
+	_, err := xc.Request(FILE_API_URL+"/{fileID}", http.MethodGet, func(r *resty.Request) {
+		r.SetContext(ctx)
+		r.SetPathParam("fileID", fileID)
+	}, &f)
+	if err != nil {
+		return nil, err
+	}
+	return &f, nil
+}
+
+func (xc *XunLeiCommon) cachePathID(path, fileID string) {
+	p := utils.FixAndCleanPath(path)
+	if p == "" || fileID == "" {
+		return
+	}
+	xc.pathIDCache.Store(p, fileID)
+}
+
+func (xc *XunLeiCommon) loadPathID(path string) (string, bool) {
+	v, ok := xc.pathIDCache.Load(utils.FixAndCleanPath(path))
+	if !ok {
+		return "", false
+	}
+	id, ok := v.(string)
+	return id, ok && id != ""
+}
+
+func (xc *XunLeiCommon) loadCachedObj(path string) (model.Obj, bool) {
+	v, ok := xc.getObjCache.Load(utils.FixAndCleanPath(path))
+	if !ok {
+		return nil, false
+	}
+	entry, ok := v.(cachedObj)
+	if !ok || entry.obj == nil {
+		return nil, false
+	}
+	if time.Now().UnixNano() > entry.expiresAt {
+		xc.getObjCache.Delete(utils.FixAndCleanPath(path))
+		return nil, false
+	}
+	return entry.obj, true
+}
+
+func (xc *XunLeiCommon) storeCachedObj(path string, obj model.Obj) {
+	if obj == nil {
+		return
+	}
+	xc.getObjCache.Store(utils.FixAndCleanPath(path), cachedObj{
+		obj:       obj,
+		expiresAt: time.Now().Add(getObjCacheTTL).UnixNano(),
+	})
+}
+
+func (xc *XunLeiCommon) resolveDirIDByPath(ctx context.Context, dirPath string) (string, error) {
+	cleanPath := utils.FixAndCleanPath(dirPath)
+	if cleanPath == "/" {
+		return "", nil
+	}
+	if id, ok := xc.loadPathID(cleanPath); ok {
+		return id, nil
+	}
+
+	parts := strings.Split(strings.TrimPrefix(cleanPath, "/"), "/")
+	curPath := "/"
+	curID := ""
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		nextPath := stdpath.Join(curPath, part)
+		if cachedID, ok := xc.loadPathID(nextPath); ok {
+			curPath = nextPath
+			curID = cachedID
+			continue
+		}
+		items, err := xc.getFiles(ctx, curID)
+		if err != nil {
+			return "", err
+		}
+		found := false
+		for _, item := range items {
+			if item.GetName() != part || !item.IsDir() {
+				continue
+			}
+			curID = item.GetID()
+			curPath = nextPath
+			xc.cachePathID(curPath, curID)
+			found = true
+			break
+		}
+		if !found {
+			return "", errs.ObjectNotFound
+		}
+	}
+	return curID, nil
 }
 
 // 设置刷新Token的方法

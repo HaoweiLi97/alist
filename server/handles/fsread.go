@@ -318,10 +318,6 @@ func FsGet(c *gin.Context) {
 	}
 	var related []model.Obj
 	parentPath := stdpath.Dir(reqPath)
-	sameLevelFiles, err := fs.List(c, parentPath, &fs.ListArgs{})
-	if err == nil {
-		related = filterRelated(sameLevelFiles, obj)
-	}
 	parentMeta, _ := op.GetNearestMeta(parentPath)
 	thumb, _ := model.GetThumb(obj)
 	common.SuccessResp(c, FsGetResp{

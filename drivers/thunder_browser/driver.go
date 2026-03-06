@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
+	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/pkg/singleflight"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	hash_extend "github.com/alist-org/alist/v3/pkg/utils/hash"
 	"github.com/aws/aws-sdk-go/aws"
@@ -15,9 +17,13 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 	"io"
 	"net/http"
+	stdpath "path"
 	"strings"
+	"sync"
+	"time"
 )
 
 type ThunderBrowser struct {
@@ -306,10 +312,121 @@ type XunLeiBrowserCommon struct {
 	*TokenResp // 登录信息
 
 	refreshTokenFunc func() error
+	pathRefCache     sync.Map // cleaned full path -> pathRef
+	getObjCache      sync.Map // cleaned full path -> cachedObj
+	getObjG          singleflight.Group[model.Obj]
 }
 
+type pathRef struct {
+	ID    string
+	Space string
+	IsDir bool
+}
+
+type cachedObj struct {
+	obj       model.Obj
+	expiresAt int64
+}
+
+const getObjCacheTTL = 15 * time.Second
+
 func (xc *XunLeiBrowserCommon) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	return xc.getFiles(ctx, dir, args.ReqPath)
+	files, err := xc.getFiles(ctx, dir, args.ReqPath)
+	if err != nil {
+		return nil, err
+	}
+	reqPath := utils.FixAndCleanPath(args.ReqPath)
+	if reqPath != "" {
+		parentSpace := ThunderBrowserDriveSpace
+		if f, ok := dir.(*Files); ok {
+			parentSpace = f.GetSpace()
+		}
+		xc.cachePathRef(reqPath, pathRef{ID: dir.GetID(), Space: parentSpace, IsDir: true})
+		for _, obj := range files {
+			ref := pathRef{ID: obj.GetID(), IsDir: obj.IsDir()}
+			if f, ok := obj.(*Files); ok {
+				ref.Space = f.GetSpace()
+			}
+			xc.cachePathRef(stdpath.Join(reqPath, obj.GetName()), ref)
+		}
+	}
+	return files, nil
+}
+
+func (xc *XunLeiBrowserCommon) Get(ctx context.Context, path string) (model.Obj, error) {
+	cleanPath := utils.FixAndCleanPath(path)
+	if cleanPath == "/" {
+		return &model.Object{
+			Name:     "root",
+			Size:     0,
+			Modified: time.Time{},
+			IsFolder: true,
+		}, nil
+	}
+
+	if cached, ok := xc.loadCachedObj(cleanPath); ok {
+		log.Debugf("[thunder_browser.get] obj-cache-hit path=%s", cleanPath)
+		return cached, nil
+	}
+
+	obj, err, shared := xc.getObjG.Do(cleanPath, func() (model.Obj, error) {
+		if cached, ok := xc.loadCachedObj(cleanPath); ok {
+			return cached, nil
+		}
+		resolved, resolveErr := xc.getNoSingleflight(ctx, cleanPath)
+		if resolveErr == nil {
+			xc.storeCachedObj(cleanPath, resolved)
+		}
+		return resolved, resolveErr
+	})
+	if shared {
+		log.Debugf("[thunder_browser.get] singleflight-shared path=%s", cleanPath)
+	}
+	return obj, err
+}
+
+func (xc *XunLeiBrowserCommon) getNoSingleflight(ctx context.Context, cleanPath string) (model.Obj, error) {
+
+	if ref, ok := xc.loadPathRef(cleanPath); ok && ref.ID != "" {
+		log.Debugf("[thunder_browser.get] cache-hit path=%s id=%s space=%s", cleanPath, ref.ID, ref.Space)
+		if obj, err := xc.getByID(ctx, ref.ID, ref.Space); err == nil {
+			log.Debugf("[thunder_browser.get] by-id success path=%s", cleanPath)
+			xc.storeCachedObj(cleanPath, obj)
+			return obj, nil
+		}
+		log.Debugf("[thunder_browser.get] by-id failed, fallback list path=%s", cleanPath)
+	}
+
+	parentPath, base := stdpath.Split(cleanPath)
+	parentPath = utils.FixAndCleanPath(parentPath)
+	parentRef, err := xc.resolveDirRefByPath(ctx, parentPath)
+	if err != nil {
+		return nil, err
+	}
+
+	parentDir := &Files{
+		ID:    parentRef.ID,
+		Space: parentRef.Space,
+		Kind:  FOLDER,
+	}
+	children, err := xc.getFiles(ctx, parentDir, parentPath)
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("[thunder_browser.get] fallback-list parent=%s", parentPath)
+	for _, child := range children {
+		if child.GetName() != base {
+			continue
+		}
+		ref := pathRef{ID: child.GetID(), IsDir: child.IsDir()}
+		if f, ok := child.(*Files); ok {
+			ref.Space = f.GetSpace()
+		}
+		xc.cachePathRef(cleanPath, ref)
+		xc.storeCachedObj(cleanPath, child)
+		return child, nil
+	}
+	return nil, errs.ObjectNotFound
 }
 
 func (xc *XunLeiBrowserCommon) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
@@ -560,6 +677,120 @@ func (xc *XunLeiBrowserCommon) getFiles(ctx context.Context, dir model.Obj, path
 		pageToken = fileList.NextPageToken
 	}
 	return files, nil
+}
+
+func (xc *XunLeiBrowserCommon) getByID(ctx context.Context, fileID, space string) (model.Obj, error) {
+	var f Files
+	params := map[string]string{
+		"_magic":         "2021",
+		"space":          space,
+		"thumbnail_size": "SIZE_LARGE",
+		"with":           "url",
+	}
+	_, err := xc.Request(FILE_API_URL+"/{fileID}", http.MethodGet, func(r *resty.Request) {
+		r.SetContext(ctx)
+		r.SetPathParam("fileID", fileID)
+		r.SetQueryParams(params)
+	}, &f)
+	if err != nil {
+		return nil, err
+	}
+	return &f, nil
+}
+
+func (xc *XunLeiBrowserCommon) cachePathRef(path string, ref pathRef) {
+	p := utils.FixAndCleanPath(path)
+	if p == "" {
+		return
+	}
+	xc.pathRefCache.Store(p, ref)
+}
+
+func (xc *XunLeiBrowserCommon) loadPathRef(path string) (pathRef, bool) {
+	v, ok := xc.pathRefCache.Load(utils.FixAndCleanPath(path))
+	if !ok {
+		return pathRef{}, false
+	}
+	ref, ok := v.(pathRef)
+	return ref, ok
+}
+
+func (xc *XunLeiBrowserCommon) loadCachedObj(path string) (model.Obj, bool) {
+	v, ok := xc.getObjCache.Load(utils.FixAndCleanPath(path))
+	if !ok {
+		return nil, false
+	}
+	entry, ok := v.(cachedObj)
+	if !ok || entry.obj == nil {
+		return nil, false
+	}
+	if time.Now().UnixNano() > entry.expiresAt {
+		xc.getObjCache.Delete(utils.FixAndCleanPath(path))
+		return nil, false
+	}
+	return entry.obj, true
+}
+
+func (xc *XunLeiBrowserCommon) storeCachedObj(path string, obj model.Obj) {
+	if obj == nil {
+		return
+	}
+	xc.getObjCache.Store(utils.FixAndCleanPath(path), cachedObj{
+		obj:       obj,
+		expiresAt: time.Now().Add(getObjCacheTTL).UnixNano(),
+	})
+}
+
+func (xc *XunLeiBrowserCommon) resolveDirRefByPath(ctx context.Context, dirPath string) (pathRef, error) {
+	cleanPath := utils.FixAndCleanPath(dirPath)
+	if cleanPath == "/" {
+		return pathRef{ID: "", Space: ThunderBrowserDriveSpace, IsDir: true}, nil
+	}
+	if ref, ok := xc.loadPathRef(cleanPath); ok && ref.IsDir {
+		return ref, nil
+	}
+
+	parts := strings.Split(strings.TrimPrefix(cleanPath, "/"), "/")
+	curPath := "/"
+	curRef := pathRef{ID: "", Space: ThunderBrowserDriveSpace, IsDir: true}
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		nextPath := stdpath.Join(curPath, part)
+		if cached, ok := xc.loadPathRef(nextPath); ok && cached.IsDir {
+			curPath = nextPath
+			curRef = cached
+			continue
+		}
+		dirObj := &Files{ID: curRef.ID, Space: curRef.Space, Kind: FOLDER}
+		items, err := xc.getFiles(ctx, dirObj, curPath)
+		if err != nil {
+			return pathRef{}, err
+		}
+		found := false
+		for _, item := range items {
+			if item.GetName() != part || !item.IsDir() {
+				continue
+			}
+			nextRef := pathRef{
+				ID:    item.GetID(),
+				IsDir: true,
+			}
+			if f, ok := item.(*Files); ok {
+				nextRef.Space = f.GetSpace()
+			}
+			xc.cachePathRef(nextPath, nextRef)
+			curPath = nextPath
+			curRef = nextRef
+			found = true
+			break
+		}
+		if !found {
+			return pathRef{}, errs.ObjectNotFound
+		}
+	}
+	return curRef, nil
 }
 
 // SetRefreshTokenFunc 设置刷新Token的方法
