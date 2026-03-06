@@ -49,6 +49,10 @@ This repository is a fork based on AList `v3.40`.
 
 - Accelerated single-file cloud drive direct-link retrieval.
 
+### docker address
+
+https://hub.docker.com/repository/docker/haoweil/alist
+
 ## Features
 
 - [x] Multiple storages
