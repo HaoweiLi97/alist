@@ -14,24 +14,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-
-      - name: Cache Musl
-        id: cache-musl
-        uses: actions/cache@v4
-        with:
-          path: build/musl-libs
-          key: docker-musl-libs-v2
-
-      - name: Download Musl Library
-        if: steps.cache-musl.outputs.cache-hit != 'true'
-        run: bash build.sh prepare docker-multiplatform
-
-      - name: Build go binary
-        run: bash build.sh release docker-multiplatform
-
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
@@ -57,11 +39,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.ci
+          file: Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/arm/v6,linux/s390x,linux/ppc64le,linux/riscv64
+          platforms: linux/amd64,linux/arm64
 
       - name: Docker meta with ffmpeg
         id: meta-ffmpeg
@@ -77,12 +59,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.ci
+          file: Dockerfile
           push: true
           tags: ${{ steps.meta-ffmpeg.outputs.tags }}
           labels: ${{ steps.meta-ffmpeg.outputs.labels }}
           build-args: INSTALL_FFMPEG=true
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/arm/v6,linux/s390x,linux/ppc64le,linux/riscv64
+          platforms: linux/amd64,linux/arm64
 
   release_docker_with_aria2:
     needs: release_docker
