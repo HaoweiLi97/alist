@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	stdpath "path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -500,6 +501,23 @@ func (xc *XunLeiBrowserCommon) Move(ctx context.Context, srcObj, dstDir model.Ob
 	return err
 }
 
+func (xc *XunLeiBrowserCommon) BatchMoveByIDs(ctx context.Context, ids []string, srcSpace, dstParentID, dstSpace string) error {
+	params := map[string]string{
+		"_from": srcSpace,
+	}
+	body := base.Json{
+		"to":    base.Json{"parent_id": dstParentID, "space": dstSpace},
+		"space": srcSpace,
+		"ids":   ids,
+	}
+	_, err := xc.Request(FILE_API_URL+":batchMove", http.MethodPost, func(r *resty.Request) {
+		r.SetContext(ctx)
+		r.SetBody(&body)
+		r.SetQueryParams(params)
+	}, nil)
+	return err
+}
+
 func (xc *XunLeiBrowserCommon) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
 
 	params := map[string]string{
@@ -628,6 +646,61 @@ func (xc *XunLeiBrowserCommon) Put(ctx context.Context, dstDir model.Obj, stream
 			Body:    io.TeeReader(stream, driver.NewProgress(stream.GetSize(), up)),
 		})
 		return err
+	}
+	return nil
+}
+
+func (xc *XunLeiBrowserCommon) OfflineDownload(ctx context.Context, fileURL string, parentDir model.Obj, fileName string) (*OfflineTask, error) {
+	var resp OfflineDownloadResp
+	body := base.Json{
+		"kind":        FILE,
+		"name":        fileName,
+		"parent_id":   parentDir.GetID(),
+		"upload_type": UPLOAD_TYPE_URL,
+		"url": base.Json{
+			"url": fileURL,
+		},
+	}
+	if files, ok := parentDir.(*Files); ok {
+		body["space"] = files.GetSpace()
+	} else {
+		body["space"] = ThunderDriveSpace
+	}
+	_, err := xc.Request(FILE_API_URL, http.MethodPost, func(r *resty.Request) {
+		r.SetContext(ctx)
+		r.SetBody(&body)
+	}, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return &resp.Task, nil
+}
+
+func (xc *XunLeiBrowserCommon) OfflineList(ctx context.Context, nextPageToken string) ([]OfflineTask, error) {
+	var resp OfflineListResp
+	_, err := xc.Request(TASK_API_URL, http.MethodGet, func(req *resty.Request) {
+		req.SetContext(ctx).SetQueryParams(map[string]string{
+			"type":       "offline",
+			"limit":      "10000",
+			"page_token": nextPageToken,
+			"space":      "default/*",
+		})
+	}, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get offline list: %w", err)
+	}
+	return resp.Tasks, nil
+}
+
+func (xc *XunLeiBrowserCommon) DeleteOfflineTasks(ctx context.Context, taskIDs []string) error {
+	_, err := xc.Request(TASK_API_URL, http.MethodDelete, func(req *resty.Request) {
+		req.SetContext(ctx).SetQueryParams(map[string]string{
+			"task_ids": strings.Join(taskIDs, ","),
+			"_t":       strconv.FormatInt(time.Now().UnixMilli(), 10),
+		})
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete tasks %v: %w", taskIDs, err)
 	}
 	return nil
 }

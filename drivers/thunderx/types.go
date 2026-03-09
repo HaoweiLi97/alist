@@ -204,3 +204,20 @@ type UploadTaskResponse struct {
 
 	File Files `json:"file"`
 }
+
+type OfflineDownloadResp struct {
+	Task OfflineTask `json:"task"`
+}
+
+type OfflineListResp struct {
+	Tasks []OfflineTask `json:"tasks"`
+}
+
+type OfflineTask struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Message  string `json:"message"`
+	Phase    string `json:"phase"`
+	Progress int64  `json:"progress"`
+	FileSize string `json:"file_size"`
+}

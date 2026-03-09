@@ -2,6 +2,7 @@ package thunderx
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/go-resty/resty/v2"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -416,6 +418,71 @@ func (xc *XunLeiXCommon) Put(ctx context.Context, dstDir model.Obj, stream model
 			Body:    stream,
 		})
 		return err
+	}
+	return nil
+}
+
+func (xc *XunLeiXCommon) OfflineDownload(ctx context.Context, fileURL string, parentDir model.Obj, fileName string) (*OfflineTask, error) {
+	var resp OfflineDownloadResp
+	_, err := xc.Request(FILE_API_URL, http.MethodPost, func(req *resty.Request) {
+		req.SetContext(ctx).SetBody(base.Json{
+			"kind":        FILE,
+			"name":        fileName,
+			"upload_type": UPLOAD_TYPE_URL,
+			"url": base.Json{
+				"url": fileURL,
+			},
+			"params":    base.Json{},
+			"parent_id": parentDir.GetID(),
+		})
+	}, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return &resp.Task, nil
+}
+
+func (xc *XunLeiXCommon) OfflineList(ctx context.Context, nextPageToken string, phase []string) ([]OfflineTask, error) {
+	if len(phase) == 0 {
+		phase = []string{"PHASE_TYPE_RUNNING", "PHASE_TYPE_ERROR", "PHASE_TYPE_COMPLETE", "PHASE_TYPE_PENDING"}
+	}
+	params := map[string]string{
+		"type":           "offline",
+		"thumbnail_size": "SIZE_SMALL",
+		"limit":          "10000",
+		"page_token":     nextPageToken,
+		"with":           "reference_resource",
+	}
+	filters := base.Json{
+		"phase": map[string]string{
+			"in": strings.Join(phase, ","),
+		},
+	}
+	filtersJSON, err := json.Marshal(filters)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal filters: %w", err)
+	}
+	params["filters"] = string(filtersJSON)
+
+	var resp OfflineListResp
+	_, err = xc.Request(TASKS_API_URL, http.MethodGet, func(req *resty.Request) {
+		req.SetContext(ctx).SetQueryParams(params)
+	}, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get offline list: %w", err)
+	}
+	return resp.Tasks, nil
+}
+
+func (xc *XunLeiXCommon) DeleteOfflineTasks(ctx context.Context, taskIDs []string, deleteFiles bool) error {
+	_, err := xc.Request(TASKS_API_URL, http.MethodDelete, func(req *resty.Request) {
+		req.SetContext(ctx).SetQueryParams(map[string]string{
+			"task_ids":     strings.Join(taskIDs, ","),
+			"delete_files": strconv.FormatBool(deleteFiles),
+		})
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete tasks %v: %w", taskIDs, err)
 	}
 	return nil
 }
