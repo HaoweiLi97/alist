@@ -77,7 +77,7 @@ outer:
 	if err != nil {
 		return err
 	}
-	if t.tool.Name() == "pikpak" {
+	if isRemoteCloudOfflineTool(t.tool.Name()) {
 		return nil
 	}
 	if t.tool.Name() == "115 Cloud" {
@@ -154,10 +154,7 @@ func (t *DownloadTask) Complete() error {
 		files []File
 		err   error
 	)
-	if t.tool.Name() == "pikpak" {
-		return nil
-	}
-	if t.tool.Name() == "115 Cloud" {
+	if isRemoteCloudOfflineTool(t.tool.Name()) || t.tool.Name() == "115 Cloud" {
 		return nil
 	}
 	if getFileser, ok := t.tool.(GetFileser); ok {
@@ -183,6 +180,15 @@ func (t *DownloadTask) Complete() error {
 		})
 	}
 	return nil
+}
+
+func isRemoteCloudOfflineTool(name string) bool {
+	switch name {
+	case "pikpak", "Thunder", "ThunderBrowser", "ThunderX":
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *DownloadTask) GetName() string {

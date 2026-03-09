@@ -24,10 +24,12 @@ output/
 *.json
 /build
 /data/
+/data-local/
 /tmp/
 /log/
 /lang/
 /daemon/
+/alist
 /public/dist/*
 /!public/dist/README.md
 

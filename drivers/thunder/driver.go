@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	stdpath "path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -481,6 +482,57 @@ func (xc *XunLeiCommon) Put(ctx context.Context, dstDir model.Obj, stream model.
 			Body:    stream,
 		})
 		return err
+	}
+	return nil
+}
+
+func (xc *XunLeiCommon) OfflineDownload(ctx context.Context, fileURL string, parentDir model.Obj, fileName string) (*OfflineTask, error) {
+	var resp OfflineDownloadResp
+	_, err := xc.Request(FILE_API_URL, http.MethodPost, func(r *resty.Request) {
+		r.SetContext(ctx)
+		r.SetBody(&base.Json{
+			"kind":        FILE,
+			"name":        fileName,
+			"parent_id":   parentDir.GetID(),
+			"upload_type": UPLOAD_TYPE_URL,
+			"space":       "",
+			"url": base.Json{
+				"url": fileURL,
+			},
+		})
+	}, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return &resp.Task, nil
+}
+
+func (xc *XunLeiCommon) OfflineList(ctx context.Context, nextPageToken string) ([]OfflineTask, error) {
+	var resp OfflineListResp
+	_, err := xc.Request(TASK_API_URL, http.MethodGet, func(req *resty.Request) {
+		req.SetContext(ctx).SetQueryParams(map[string]string{
+			"type":       "offline",
+			"limit":      "10000",
+			"page_token": nextPageToken,
+			"space":      "",
+		})
+	}, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get offline list: %w", err)
+	}
+	return resp.Tasks, nil
+}
+
+func (xc *XunLeiCommon) DeleteOfflineTasks(ctx context.Context, taskIDs []string, deleteFiles bool) error {
+	_, err := xc.Request(TASK_API_URL, http.MethodDelete, func(req *resty.Request) {
+		req.SetContext(ctx).SetQueryParams(map[string]string{
+			"task_ids":     strings.Join(taskIDs, ","),
+			"delete_files": strconv.FormatBool(deleteFiles),
+			"space":        "",
+		})
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete tasks %v: %w", taskIDs, err)
 	}
 	return nil
 }

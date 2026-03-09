@@ -159,6 +159,7 @@ func _fs(g *gin.RouterGroup) {
 	g.POST("/batch_rename", handles.FsBatchRename)
 	g.POST("/regex_rename", handles.FsRegexRename)
 	g.POST("/move", handles.FsMove)
+	g.POST("/move_thunder_batch", handles.FsMoveThunderBatch)
 	g.POST("/recursive_move", handles.FsRecursiveMove)
 	g.POST("/copy", handles.FsCopy)
 	g.POST("/remove", handles.FsRemove)
