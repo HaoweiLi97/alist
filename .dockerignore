@@ -1,0 +1,15 @@
+.git
+.github
+.air.toml
+data
+data-local
+bin
+build
+dist
+test-results
+*.db
+*.db-shm
+*.db-wal
+*.log
+coverage.out
+node_modules
