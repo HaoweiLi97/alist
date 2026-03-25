@@ -2,6 +2,9 @@ version: '3.3'
 services:
   alist:
     restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
     volumes:
       - '/etc/alist:/opt/alist/data'
     ports:
@@ -13,4 +16,4 @@ services:
       - UMASK=022
       - TZ=UTC
     container_name: alist
-    image: 'xhofe/alist:latest'
+    image: 'alist-local:latest'

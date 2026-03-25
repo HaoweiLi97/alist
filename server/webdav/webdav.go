@@ -630,19 +630,23 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 	if err != nil {
 		return 403, err
 	}
-	fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{})
-	if err != nil {
-		if errs.IsNotFoundError(err) {
-			return http.StatusNotFound, err
-		}
-		return http.StatusMethodNotAllowed, err
-	}
 	depth := infiniteDepth
 	if hdr := r.Header.Get("Depth"); hdr != "" {
 		depth = parseDepth(hdr)
 		if depth == invalidDepth {
 			return http.StatusBadRequest, errInvalidDepth
 		}
+	}
+	// Depth: 0 PROPFIND is commonly used by WebDAV clients as an existence/stat check.
+	// Force a refresh here so recently moved or deleted paths are not answered from
+	// AList's parent directory cache.
+	refresh := depth == 0
+	fi, err := fs.Get(ctx, reqPath, &fs.GetArgs{Refresh: refresh})
+	if err != nil {
+		if errs.IsNotFoundError(err) {
+			return http.StatusNotFound, err
+		}
+		return http.StatusMethodNotAllowed, err
 	}
 	pf, status, err := readPropfind(r.Body)
 	if err != nil {
