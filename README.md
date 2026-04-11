@@ -1,9 +1,7 @@
 ## One-click Docker Deploy
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HaoweiLi97/alist/main/scripts/one-click-alist-deploy.sh -o one-click-alist-deploy.sh \
-  && chmod +x one-click-alist-deploy.sh \
-  && ./one-click-alist-deploy.sh
+curl -fsSL https://raw.githubusercontent.com/HaoweiLi97/alist/main/scripts/one-click-alist-deploy.sh | bash
 ```
 
 <div align="center">
