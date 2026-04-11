@@ -1,3 +1,11 @@
+## One-click Docker Deploy
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HaoweiLi97/alist/main/scripts/one-click-alist-deploy.sh -o one-click-alist-deploy.sh \
+  && chmod +x one-click-alist-deploy.sh \
+  && ./one-click-alist-deploy.sh
+```
+
 <div align="center">
   <a href="https://alist.nn.ci"><img width="100px" alt="logo" src="https://cdn.jsdelivr.net/gh/alist-org/logo@main/logo.svg"/></a>
   <p><em>🗂️A file list program that supports multiple storages, powered by Gin and Solidjs.</em></p>
@@ -40,18 +48,6 @@
 ---
 
 English | [中文](./README_cn.md)| [日本語](./README_ja.md) | [Contributing](./CONTRIBUTING.md) | [CODE_OF_CONDUCT](./CODE_OF_CONDUCT.md)
-
-## Fork Notice
-
-This repository is a fork based on AList `v3.40`.
-
-### Custom updates
-
-- Accelerated single-file cloud drive direct-link retrieval.
-
-### docker address
-
-https://hub.docker.com/repository/docker/haoweil/alist
 
 ## Features
 

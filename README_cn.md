@@ -1,3 +1,11 @@
+## 一键 Docker 部署
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HaoweiLi97/alist/main/scripts/one-click-alist-deploy.sh -o one-click-alist-deploy.sh \
+  && chmod +x one-click-alist-deploy.sh \
+  && ./one-click-alist-deploy.sh
+```
+
 <div align="center">
   <a href="https://alist.nn.ci"><img width="100px" alt="logo" src="https://cdn.jsdelivr.net/gh/alist-org/logo@main/logo.svg"/></a>
   <p><em>🗂一个支持多存储的文件列表程序，使用 Gin 和 Solidjs。</em></p>
@@ -40,14 +48,6 @@
 ---
 
 [English](./README.md) | 中文 | [日本語](./README_ja.md) | [Contributing](./CONTRIBUTING.md) | [CODE_OF_CONDUCT](./CODE_OF_CONDUCT.md)
-
-## Fork 说明
-
-本仓库是基于 AList `v3.40` 的 Fork 版本。
-
-### 自定义更新
-
-- 加速单文件网盘直链获取。
 
 ## 功能
 
