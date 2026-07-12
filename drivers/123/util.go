@@ -260,13 +260,12 @@ func (d *Pan123) getFiles(ctx context.Context, parentId string, name string) ([]
 			"operateType":          "4",
 			"inDirectSpace":        "false",
 		}
-		_res, err := d.request(FileList, http.MethodGet, func(req *resty.Request) {
+		_, err := d.request(FileList, http.MethodGet, func(req *resty.Request) {
 			req.SetQueryParams(query)
 		}, &resp)
 		if err != nil {
 			return nil, err
 		}
-		log.Debug(string(_res))
 		page++
 		res = append(res, resp.Data.InfoList...)
 		total = resp.Data.Total

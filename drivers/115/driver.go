@@ -293,7 +293,7 @@ func (d *Pan115) MakeDir(ctx context.Context, parentDir model.Obj, dirName strin
 	}
 	f, err := d.getNewFile(result.FileID)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	return f, nil
 }
@@ -307,7 +307,7 @@ func (d *Pan115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj,
 	}
 	f, err := d.getNewFile(srcObj.GetID())
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	return f, nil
 }
@@ -321,7 +321,7 @@ func (d *Pan115) Rename(ctx context.Context, srcObj model.Obj, newName string) (
 	}
 	f, err := d.getNewFile((srcObj.GetID()))
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	return f, nil
 }
@@ -390,7 +390,7 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	// rapid-upload
 	// note that 115 add timeout for rapid-upload,
 	// and "sig invalid" err is thrown even when the hash is correct after timeout.
-	if fastInfo, err = d.rapidUpload(stream.GetSize(), stream.GetName(), dirID, preHash, fullHash, stream); err != nil {
+	if fastInfo, err = d.rapidUpload(ctx, stream.GetSize(), stream.GetName(), dirID, preHash, fullHash, stream); err != nil {
 		return nil, err
 	}
 	if matched, err := fastInfo.Ok(); err != nil {
@@ -398,7 +398,7 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	} else if matched {
 		f, err := d.getNewFileByPickCode(fastInfo.PickCode)
 		if err != nil {
-			return nil, nil
+			return nil, err
 		}
 		return f, nil
 	}
@@ -406,19 +406,19 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	var uploadResult *UploadResult
 	// 闪传失败，上传
 	if stream.GetSize() <= 10*utils.MB { // 文件大小小于10MB，改用普通模式上传
-		if uploadResult, err = d.UploadByOSS(&fastInfo.UploadOSSParams, stream, dirID); err != nil {
+		if uploadResult, err = d.UploadByOSS(ctx, &fastInfo.UploadOSSParams, stream, dirID, up); err != nil {
 			return nil, err
 		}
 	} else {
 		// 分片上传
-		if uploadResult, err = d.UploadByMultipart(&fastInfo.UploadOSSParams, stream.GetSize(), stream, dirID); err != nil {
+		if uploadResult, err = d.UploadByMultipart(ctx, &fastInfo.UploadOSSParams, stream.GetSize(), stream, dirID, up); err != nil {
 			return nil, err
 		}
 	}
 
 	file, err := d.getNewFile(uploadResult.Data.FileID)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	return file, nil
 }

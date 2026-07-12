@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -163,13 +164,12 @@ func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.File
 	}
 	sha1Str := hex.EncodeToString(s.Sum(nil))
 	// pre
-	pre, err := d.upPre(stream, dstDir.GetID())
+	pre, err := d.upPre(ctx, stream, dstDir.GetID())
 	if err != nil {
 		return err
 	}
-	log.Debugln("hash: ", md5Str, sha1Str)
 	// hash
-	finish, err := d.upHash(md5Str, sha1Str, pre.Data.TaskId)
+	finish, err := d.upHash(ctx, md5Str, sha1Str, pre.Data.TaskId)
 	if err != nil {
 		return err
 	}
@@ -178,6 +178,9 @@ func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.File
 	}
 	// part up
 	partSize := pre.Metadata.PartSize
+	if partSize <= 0 {
+		return fmt.Errorf("invalid upload part size: %d", partSize)
+	}
 	var bytes []byte
 	md5s := make([]string, 0)
 	defaultBytes := make([]byte, partSize)
@@ -211,11 +214,11 @@ func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.File
 		partNumber++
 		up(100 * float64(total-left) / float64(total))
 	}
-	err = d.upCommit(pre, md5s)
+	err = d.upCommit(ctx, pre, md5s)
 	if err != nil {
 		return err
 	}
-	return d.upFinish(pre)
+	return d.upFinish(ctx, pre)
 }
 
 var _ driver.Driver = (*QuarkOrUC)(nil)

@@ -39,13 +39,13 @@ func (d *AliyundriveOpen) _refreshToken() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	log.Debugf("[ali_open] refresh token response: %s", res.String())
+	log.Debugf("[ali_open] refresh token response status: %s", res.Status())
 	if e.Code != "" {
 		return "", "", fmt.Errorf("failed to refresh token: %s", e.Message)
 	}
 	refresh, access := utils.Json.Get(res.Body(), "refresh_token").ToString(), utils.Json.Get(res.Body(), "access_token").ToString()
 	if refresh == "" {
-		return "", "", fmt.Errorf("failed to refresh token: refresh token is empty, resp: %s", res.String())
+		return "", "", errors.New("failed to refresh token: refresh token is empty")
 	}
 	curSub, err := getSub(d.RefreshToken)
 	if err != nil {
@@ -86,7 +86,7 @@ func (d *AliyundriveOpen) refreshToken() error {
 	if err != nil {
 		return err
 	}
-	log.Infof("[ali_open] token exchange: %s -> %s", d.RefreshToken, refresh)
+	log.Infof("[ali_open] token refreshed")
 	d.RefreshToken, d.AccessToken = refresh, access
 	op.MustSaveDriverStorage(d)
 	return nil

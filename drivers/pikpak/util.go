@@ -10,6 +10,7 @@ import (
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
+	group "github.com/alist-org/alist/v3/pkg/errgroup"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	jsoniter "github.com/json-iterator/go"
@@ -21,6 +22,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
@@ -459,7 +461,7 @@ func (d *PikPak) refreshCaptchaToken(action string, metas map[string]string) err
 	return nil
 }
 
-func (d *PikPak) UploadByOSS(params *S3Params, stream model.FileStreamer, up driver.UpdateProgress) error {
+func (d *PikPak) UploadByOSS(ctx context.Context, params *S3Params, stream model.FileStreamer, up driver.UpdateProgress) error {
 	ossClient, err := oss.New(params.Endpoint, params.AccessKeyID, params.AccessKeySecret)
 	if err != nil {
 		return err
@@ -469,14 +471,14 @@ func (d *PikPak) UploadByOSS(params *S3Params, stream model.FileStreamer, up dri
 		return err
 	}
 
-	err = bucket.PutObject(params.Key, stream, OssOption(params)...)
+	err = bucket.PutObject(params.Key, io.TeeReader(stream, driver.NewProgress(stream.GetSize(), up)), append(OssOption(params), oss.WithContext(ctx))...)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (d *PikPak) UploadByMultipart(params *S3Params, fileSize int64, stream model.FileStreamer, up driver.UpdateProgress) error {
+func (d *PikPak) UploadByMultipart(ctx context.Context, params *S3Params, fileSize int64, stream model.FileStreamer, up driver.UpdateProgress) error {
 	var (
 		chunks    []oss.FileChunk
 		parts     []oss.UploadPart
@@ -499,10 +501,8 @@ func (d *PikPak) UploadByMultipart(params *S3Params, fileSize int64, stream mode
 		return err
 	}
 
-	ticker := time.NewTicker(time.Hour * 12)
-	defer ticker.Stop()
-	// 设置超时
-	timeout := time.NewTimer(time.Hour * 24)
+	uploadCtx, cancel := context.WithTimeout(ctx, 24*time.Hour)
+	defer cancel()
 
 	if chunks, err = SplitFile(fileSize); err != nil {
 		return err
@@ -511,83 +511,52 @@ func (d *PikPak) UploadByMultipart(params *S3Params, fileSize int64, stream mode
 	if imur, err = bucket.InitiateMultipartUpload(params.Key,
 		oss.SetHeader(OssSecurityTokenHeaderName, params.SecurityToken),
 		oss.UserAgentHeader(OSSUserAgent),
+		oss.WithContext(uploadCtx),
 	); err != nil {
 		return err
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(chunks))
-
-	chunksCh := make(chan oss.FileChunk)
-	errCh := make(chan error)
-	UploadedPartsCh := make(chan oss.UploadPart)
-	quit := make(chan struct{})
-
-	// producer
-	go chunksProducer(chunksCh, chunks)
-	go func() {
-		wg.Wait()
-		quit <- struct{}{}
-	}()
-
-	// consumers
-	for i := 0; i < ThreadsNum; i++ {
-		go func(threadId int) {
-			defer func() {
-				if r := recover(); r != nil {
-					errCh <- fmt.Errorf("recovered in %v", r)
-				}
-			}()
-			for chunk := range chunksCh {
-				var part oss.UploadPart // 出现错误就继续尝试，共尝试3次
-				for retry := 0; retry < 3; retry++ {
-					select {
-					case <-ticker.C:
-						errCh <- errors.Wrap(err, "ossToken 过期")
-					default:
-					}
-
-					buf := make([]byte, chunk.Size)
-					if _, err = tmpF.ReadAt(buf, chunk.Offset); err != nil && !errors.Is(err, io.EOF) {
-						continue
-					}
-
-					b := bytes.NewBuffer(buf)
-					if part, err = bucket.UploadPart(imur, b, chunk.Size, chunk.Number, OssOption(params)...); err == nil {
-						break
-					}
-				}
-				if err != nil {
-					errCh <- errors.Wrap(err, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", stream.GetName(), chunk.Number, err))
-				}
-				UploadedPartsCh <- part
+	parts = make([]oss.UploadPart, len(chunks))
+	var uploaded atomic.Int64
+	var progressMu sync.Mutex
+	g, _ := group.NewGroupWithContext(uploadCtx, ThreadsNum)
+	for i, chunk := range chunks {
+		i, chunk := i, chunk
+		g.Go(func(partCtx context.Context) error {
+			buf := make([]byte, chunk.Size)
+			if _, readErr := io.ReadFull(io.NewSectionReader(tmpF, chunk.Offset, chunk.Size), buf); readErr != nil {
+				return errors.Wrapf(readErr, "read upload chunk %d", chunk.Number)
 			}
-		}(i)
+			var part oss.UploadPart
+			var uploadErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				part, uploadErr = bucket.UploadPart(imur, bytes.NewReader(buf), chunk.Size, chunk.Number,
+					append(OssOption(params), oss.WithContext(partCtx))...)
+				if uploadErr == nil {
+					parts[i] = part
+					done := uploaded.Add(chunk.Size)
+					progressMu.Lock()
+					up(float64(done) * 100 / float64(fileSize))
+					progressMu.Unlock()
+					return nil
+				}
+				if attempt < 3 {
+					select {
+					case <-partCtx.Done():
+						return partCtx.Err()
+					case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+					}
+				}
+			}
+			return errors.Wrapf(uploadErr, "upload %s chunk %d", stream.GetName(), chunk.Number)
+		})
 	}
-
-	go func() {
-		for part := range UploadedPartsCh {
-			parts = append(parts, part)
-			wg.Done()
-		}
-	}()
-LOOP:
-	for {
-		select {
-		case <-ticker.C:
-			// ossToken 过期
-			return err
-		case <-quit:
-			break LOOP
-		case <-errCh:
-			return err
-		case <-timeout.C:
-			return fmt.Errorf("time out")
-		}
+	if err = g.Wait(); err != nil {
+		return err
 	}
 
 	// EOF错误是xml的Unmarshal导致的，响应其实是json格式，所以实际上上传是成功的
-	if _, err = bucket.CompleteMultipartUpload(imur, parts, OssOption(params)...); err != nil && !errors.Is(err, io.EOF) {
+	if _, err = bucket.CompleteMultipartUpload(imur, parts, append(OssOption(params), oss.WithContext(uploadCtx))...); err != nil && !errors.Is(err, io.EOF) {
 		// 当文件名含有 &< 这两个字符之一时响应的xml解析会出现错误，实际上上传是成功的
 		if filename := filepath.Base(stream.GetName()); !strings.ContainsAny(filename, "&<") {
 			return err
@@ -596,13 +565,10 @@ LOOP:
 	return nil
 }
 
-func chunksProducer(ch chan oss.FileChunk, chunks []oss.FileChunk) {
-	for _, chunk := range chunks {
-		ch <- chunk
-	}
-}
-
 func SplitFile(fileSize int64) (chunks []oss.FileChunk, err error) {
+	if fileSize <= 0 {
+		return nil, errors.New("file size must be positive")
+	}
 	for i := int64(1); i < 10; i++ {
 		if fileSize < i*utils.GB { // 文件大小小于iGB时分为i*100片
 			if chunks, err = SplitFileByPartNum(fileSize, int(i*100)); err != nil {
@@ -611,7 +577,7 @@ func SplitFile(fileSize int64) (chunks []oss.FileChunk, err error) {
 			break
 		}
 	}
-	if fileSize > 9*utils.GB { // 文件大小大于9GB时分为1000片
+	if fileSize >= 9*utils.GB { // 文件大小大于等于9GB时分为1000片
 		if chunks, err = SplitFileByPartNum(fileSize, 1000); err != nil {
 			return
 		}

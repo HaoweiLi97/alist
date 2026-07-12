@@ -24,7 +24,7 @@ func Auth(c *gin.Context) {
 			return
 		}
 		c.Set("user", admin)
-		log.Debugf("use admin token: %+v", admin)
+		log.Debugf("authenticated user: %s", admin.Username)
 		c.Next()
 		return
 	}
@@ -41,7 +41,7 @@ func Auth(c *gin.Context) {
 			return
 		}
 		c.Set("user", guest)
-		log.Debugf("use empty token: %+v", guest)
+		log.Debugf("authenticated guest user: %s", guest.Username)
 		c.Next()
 		return
 	}
@@ -69,7 +69,7 @@ func Auth(c *gin.Context) {
 		return
 	}
 	c.Set("user", user)
-	log.Debugf("use login token: %+v", user)
+	log.Debugf("authenticated user: %s", user.Username)
 	c.Next()
 }
 
@@ -83,7 +83,7 @@ func Authn(c *gin.Context) {
 			return
 		}
 		c.Set("user", admin)
-		log.Debugf("use admin token: %+v", admin)
+		log.Debugf("authenticated user: %s", admin.Username)
 		c.Next()
 		return
 	}
@@ -95,7 +95,7 @@ func Authn(c *gin.Context) {
 			return
 		}
 		c.Set("user", guest)
-		log.Debugf("use empty token: %+v", guest)
+		log.Debugf("authenticated guest user: %s", guest.Username)
 		c.Next()
 		return
 	}
@@ -123,7 +123,7 @@ func Authn(c *gin.Context) {
 		return
 	}
 	c.Set("user", user)
-	log.Debugf("use login token: %+v", user)
+	log.Debugf("authenticated user: %s", user.Username)
 	c.Next()
 }
 

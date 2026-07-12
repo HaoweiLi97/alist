@@ -509,7 +509,7 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 	return errors.WithStack(err)
 }
 
-func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file model.FileStreamer, up driver.UpdateProgress, lazyCache ...bool) error {
+func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file model.FileStreamer, up driver.UpdateProgress, lazyCache ...bool) (err error) {
 	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
 		return errors.Errorf("storage not init: %s", storage.GetStorage().Status)
 	}
@@ -524,6 +524,7 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 	tempName := file.GetName() + ".alist_to_delete"
 	tempPath := stdpath.Join(dstDirPath, tempName)
 	fi, err := GetUnwrap(ctx, storage, dstPath)
+	overwriteBackup := false
 	if err == nil {
 		if fi.GetSize() == 0 {
 			err = Remove(ctx, storage, dstPath)
@@ -536,6 +537,22 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 			if err != nil {
 				return err
 			}
+			overwriteBackup = true
+			defer func() {
+				if !overwriteBackup {
+					return
+				}
+				rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				defer cancel()
+				// A failed multipart upload may leave a placeholder at the destination.
+				// Remove it before restoring the original file name.
+				if removeErr := Remove(rollbackCtx, storage, dstPath); removeErr != nil {
+					log.Errorf("failed remove incomplete upload [%s] during overwrite rollback: %+v", dstPath, removeErr)
+				}
+				if recoverErr := Rename(rollbackCtx, storage, tempPath, file.GetName()); recoverErr != nil {
+					log.Errorf("failed recover old obj: %+v", recoverErr)
+				}
+			}()
 		} else {
 			file.SetExist(fi)
 		}
@@ -574,23 +591,14 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		return errs.NotImplement
 	}
 	log.Debugf("put file [%s] done", file.GetName())
-	if storage.Config().NoOverwriteUpload && fi != nil && fi.GetSize() > 0 {
-		if err != nil {
-			// upload failed, recover old obj
-			err := Rename(ctx, storage, tempPath, file.GetName())
-			if err != nil {
-				log.Errorf("failed recover old obj: %+v", err)
-			}
-		} else {
-			// upload success, remove old obj
-			err := Remove(ctx, storage, tempPath)
-			if err != nil {
-				return err
-			} else {
-				key := Key(storage, stdpath.Join(dstDirPath, file.GetName()))
-				linkCache.Del(key)
-			}
+	if overwriteBackup && err == nil {
+		// upload success, remove old obj and commit the overwrite
+		if removeErr := Remove(ctx, storage, tempPath); removeErr != nil {
+			return removeErr
 		}
+		overwriteBackup = false
+		key := Key(storage, stdpath.Join(dstDirPath, file.GetName()))
+		linkCache.Del(key)
 	}
 	return errors.WithStack(err)
 }

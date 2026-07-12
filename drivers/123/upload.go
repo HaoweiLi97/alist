@@ -1,12 +1,14 @@
 package _123
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -103,7 +105,11 @@ func (d *Pan123) newUpload(ctx context.Context, upReq *UploadResp, file model.Fi
 			if j == chunkCount {
 				curSize = file.GetSize() - (int64(chunkCount)-1)*chunkSize
 			}
-			err = d.uploadS3Chunk(ctx, upReq, s3PreSignedUrls, j, end, io.LimitReader(reader, chunkSize), curSize, false, getS3UploadUrl)
+			chunk := make([]byte, curSize)
+			if _, err = io.ReadFull(reader, chunk); err != nil {
+				return fmt.Errorf("read upload chunk %d: %w", j, err)
+			}
+			err = d.uploadS3Chunk(ctx, upReq, s3PreSignedUrls, j, end, chunk, getS3UploadUrl)
 			if err != nil {
 				return err
 			}
@@ -114,42 +120,44 @@ func (d *Pan123) newUpload(ctx context.Context, upReq *UploadResp, file model.Fi
 	return d.completeS3(ctx, upReq, file, chunkCount > 1)
 }
 
-func (d *Pan123) uploadS3Chunk(ctx context.Context, upReq *UploadResp, s3PreSignedUrls *S3PreSignedURLs, cur, end int, reader io.Reader, curSize int64, retry bool, getS3UploadUrl func(ctx context.Context, upReq *UploadResp, start int, end int) (*S3PreSignedURLs, error)) error {
-	uploadUrl := s3PreSignedUrls.Data.PreSignedUrls[strconv.Itoa(cur)]
-	if uploadUrl == "" {
-		return fmt.Errorf("upload url is empty, s3PreSignedUrls: %+v", s3PreSignedUrls)
-	}
-	req, err := http.NewRequest("PUT", uploadUrl, reader)
-	if err != nil {
-		return err
-	}
-	req = req.WithContext(ctx)
-	req.ContentLength = curSize
-	//req.Header.Set("Content-Length", strconv.FormatInt(curSize, 10))
-	res, err := base.HttpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode == http.StatusForbidden {
-		if retry {
-			return fmt.Errorf("upload s3 chunk %d failed, status code: %d", cur, res.StatusCode)
+func (d *Pan123) uploadS3Chunk(ctx context.Context, upReq *UploadResp, s3PreSignedUrls *S3PreSignedURLs, cur, end int, chunk []byte, getS3UploadUrl func(ctx context.Context, upReq *UploadResp, start int, end int) (*S3PreSignedURLs, error)) error {
+	refreshedURL := false
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		uploadURL := s3PreSignedUrls.Data.PreSignedUrls[strconv.Itoa(cur)]
+		if uploadURL == "" {
+			return fmt.Errorf("upload URL is empty for chunk %d", cur)
 		}
-		// refresh s3 pre signed urls
-		newS3PreSignedUrls, err := getS3UploadUrl(ctx, upReq, cur, end)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(chunk))
 		if err != nil {
 			return err
 		}
-		s3PreSignedUrls.Data.PreSignedUrls = newS3PreSignedUrls.Data.PreSignedUrls
-		// retry
-		return d.uploadS3Chunk(ctx, upReq, s3PreSignedUrls, cur, end, reader, curSize, true, getS3UploadUrl)
-	}
-	if res.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(res.Body)
+		req.ContentLength = int64(len(chunk))
+		res, err := base.HttpClient.Do(req)
 		if err != nil {
-			return err
+			lastErr = err
+		} else {
+			_ = res.Body.Close()
+			if res.StatusCode == http.StatusOK {
+				return nil
+			}
+			lastErr = fmt.Errorf("upload S3 chunk %d failed, status code: %d", cur, res.StatusCode)
+			if res.StatusCode == http.StatusForbidden && !refreshedURL {
+				newURLs, refreshErr := getS3UploadUrl(ctx, upReq, cur, end)
+				if refreshErr != nil {
+					return refreshErr
+				}
+				s3PreSignedUrls.Data.PreSignedUrls = newURLs.Data.PreSignedUrls
+				refreshedURL = true
+			}
 		}
-		return fmt.Errorf("upload s3 chunk %d failed, status code: %d, body: %s", cur, res.StatusCode, body)
+		if attempt < 3 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
+			}
+		}
 	}
-	return nil
+	return lastErr
 }

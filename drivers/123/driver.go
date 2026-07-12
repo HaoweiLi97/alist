@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"golang.org/x/time/rate"
 	"io"
 	"net/http"
 	"net/url"
@@ -23,7 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/go-resty/resty/v2"
-	log "github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 )
 
 type Pan123 struct {
@@ -82,7 +81,7 @@ func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 			"type":      f.Type,
 		}
 		resp, err := d.request(DownloadInfo, http.MethodPost, func(req *resty.Request) {
-			
+
 			req.SetBody(data).SetHeaders(headers)
 		}, nil)
 		if err != nil {
@@ -102,16 +101,13 @@ func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 			}
 		}
 		u_ := u.String()
-		log.Debug("download url: ", u_)
 		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://www.123pan.com/").Get(u_)
 		if err != nil {
 			return nil, err
 		}
-		log.Debug(res.String())
 		link := model.Link{
 			URL: u_,
 		}
-		log.Debugln("res code: ", res.StatusCode())
 		if res.StatusCode() == 302 {
 			link.URL = res.Header().Get("location")
 		} else if res.StatusCode() < 300 {
@@ -213,13 +209,12 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 		"type":         0,
 	}
 	var resp UploadResp
-	res, err := d.request(UploadRequest, http.MethodPost, func(req *resty.Request) {
+	_, err = d.request(UploadRequest, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data).SetContext(ctx)
 	}, &resp)
 	if err != nil {
 		return err
 	}
-	log.Debugln("upload request res: ", string(res))
 	if resp.Data.Reuse || resp.Data.Key == "" {
 		return nil
 	}
@@ -247,6 +242,9 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 			Body:   tempFile,
 		}
 		_, err = uploader.UploadWithContext(ctx, input)
+		if err != nil {
+			return err
+		}
 	}
 	_, err = d.request(UploadComplete, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{

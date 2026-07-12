@@ -121,18 +121,22 @@ func CreateTempFile(r io.Reader, size int64) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}
 	readBytes, err := CopyWithBuffer(f, r)
 	if err != nil {
-		_ = os.Remove(f.Name())
+		cleanup()
 		return nil, errs.NewErr(err, "CreateTempFile failed")
 	}
 	if size > 0 && readBytes != size {
-		_ = os.Remove(f.Name())
-		return nil, errs.NewErr(err, "CreateTempFile failed, incoming stream actual size= %d, expect = %d ", readBytes, size)
+		cleanup()
+		return nil, errs.NewErr(errs.StreamIncomplete, "CreateTempFile failed, incoming stream actual size= %d, expect = %d ", readBytes, size)
 	}
 	_, err = f.Seek(0, io.SeekStart)
 	if err != nil {
-		_ = os.Remove(f.Name())
+		cleanup()
 		return nil, errs.NewErr(err, "CreateTempFile failed, can't seek to 0 ")
 	}
 	return f, nil

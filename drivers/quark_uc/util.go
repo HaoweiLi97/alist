@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +18,6 @@ import (
 	"github.com/alist-org/alist/v3/pkg/cookie"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
-	log "github.com/sirupsen/logrus"
 )
 
 // do others that not defined in Driver interface
@@ -85,7 +85,7 @@ func (d *QuarkOrUC) GetFiles(parent string) ([]File, error) {
 	return files, nil
 }
 
-func (d *QuarkOrUC) upPre(file model.FileStreamer, parentId string) (UpPreResp, error) {
+func (d *QuarkOrUC) upPre(ctx context.Context, file model.FileStreamer, parentId string) (UpPreResp, error) {
 	now := time.Now()
 	data := base.Json{
 		"ccp_hash_update": true,
@@ -100,23 +100,41 @@ func (d *QuarkOrUC) upPre(file model.FileStreamer, parentId string) (UpPreResp, 
 	}
 	var resp UpPreResp
 	_, err := d.request("/file/upload/pre", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(data)
+		req.SetContext(ctx).SetBody(data)
 	}, &resp)
 	return resp, err
 }
 
-func (d *QuarkOrUC) upHash(md5, sha1, taskId string) (bool, error) {
+func (d *QuarkOrUC) upHash(ctx context.Context, md5, sha1, taskId string) (bool, error) {
 	data := base.Json{
 		"md5":     md5,
 		"sha1":    sha1,
 		"task_id": taskId,
 	}
-	log.Debugf("hash: %+v", data)
 	var resp HashResp
 	_, err := d.request("/file/update/hash", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(data)
+		req.SetContext(ctx).SetBody(data)
 	}, &resp)
 	return resp.Data.Finish, err
+}
+
+func uploadURL(pre UpPreResp) (string, error) {
+	rawURL := strings.TrimSpace(pre.Data.UploadUrl)
+	if !strings.Contains(rawURL, "://") {
+		rawURL = "https://" + strings.TrimPrefix(rawURL, "//")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return "", fmt.Errorf("invalid upload URL")
+	}
+	if pre.Data.Bucket == "" || pre.Data.ObjKey == "" {
+		return "", fmt.Errorf("invalid upload target")
+	}
+	return (&url.URL{
+		Scheme: "https",
+		Host:   pre.Data.Bucket + "." + parsed.Host,
+		Path:   "/" + strings.TrimPrefix(pre.Data.ObjKey, "/"),
+	}).String(), nil
 }
 
 func (d *QuarkOrUC) upPart(ctx context.Context, pre UpPreResp, mineType string, partNumber int, bytes []byte) (string, error) {
@@ -150,7 +168,10 @@ x-oss-user-agent:aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit
 	//		return "finish", nil
 	//	}
 	//}
-	u := fmt.Sprintf("https://%s.%s/%s", pre.Data.Bucket, pre.Data.UploadUrl[7:], pre.Data.ObjKey)
+	u, err := uploadURL(pre)
+	if err != nil {
+		return "", err
+	}
 	res, err := base.RestyClient.R().SetContext(ctx).
 		SetHeaders(map[string]string{
 			"Authorization":    resp.Data.AuthKey,
@@ -163,15 +184,17 @@ x-oss-user-agent:aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit
 			"partNumber": strconv.Itoa(partNumber),
 			"uploadId":   pre.Data.UploadId,
 		}).SetBody(bytes).Put(u)
+	if err != nil {
+		return "", err
+	}
 	if res.StatusCode() != 200 {
 		return "", fmt.Errorf("up status: %d, error: %s", res.StatusCode(), res.String())
 	}
 	return res.Header().Get("ETag"), nil
 }
 
-func (d *QuarkOrUC) upCommit(pre UpPreResp, md5s []string) error {
+func (d *QuarkOrUC) upCommit(ctx context.Context, pre UpPreResp, md5s []string) error {
 	timeStr := time.Now().UTC().Format(http.TimeFormat)
-	log.Debugf("md5s: %+v", md5s)
 	bodyBuilder := strings.Builder{}
 	bodyBuilder.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUpload>
@@ -207,17 +230,18 @@ x-oss-user-agent:aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit
 			pre.Data.Bucket, pre.Data.ObjKey, pre.Data.UploadId),
 		"task_id": pre.Data.TaskId,
 	}
-	log.Debugf("xml: %s", body)
-	log.Debugf("auth data: %+v", data)
 	var resp UpAuthResp
 	_, err = d.request("/file/upload/auth", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(data)
+		req.SetContext(ctx).SetBody(data)
 	}, &resp)
 	if err != nil {
 		return err
 	}
-	u := fmt.Sprintf("https://%s.%s/%s", pre.Data.Bucket, pre.Data.UploadUrl[7:], pre.Data.ObjKey)
-	res, err := base.RestyClient.R().
+	u, err := uploadURL(pre)
+	if err != nil {
+		return err
+	}
+	res, err := base.RestyClient.R().SetContext(ctx).
 		SetHeaders(map[string]string{
 			"Authorization":    resp.Data.AuthKey,
 			"Content-MD5":      contentMd5,
@@ -230,23 +254,30 @@ x-oss-user-agent:aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit
 		SetQueryParams(map[string]string{
 			"uploadId": pre.Data.UploadId,
 		}).SetBody(body).Post(u)
+	if err != nil {
+		return err
+	}
 	if res.StatusCode() != 200 {
 		return fmt.Errorf("up status: %d, error: %s", res.StatusCode(), res.String())
 	}
 	return nil
 }
 
-func (d *QuarkOrUC) upFinish(pre UpPreResp) error {
+func (d *QuarkOrUC) upFinish(ctx context.Context, pre UpPreResp) error {
 	data := base.Json{
 		"obj_key": pre.Data.ObjKey,
 		"task_id": pre.Data.TaskId,
 	}
 	_, err := d.request("/file/upload/finish", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(data)
+		req.SetContext(ctx).SetBody(data)
 	}, nil)
 	if err != nil {
 		return err
 	}
-	time.Sleep(time.Second)
-	return nil
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Second):
+		return nil
+	}
 }

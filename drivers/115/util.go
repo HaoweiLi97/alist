@@ -2,6 +2,7 @@ package _115
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/hex"
@@ -12,10 +13,10 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/http_range"
 	"github.com/alist-org/alist/v3/pkg/utils"
@@ -168,7 +169,7 @@ func (c *Pan115) GenerateToken(fileID, preID, timeStamp, fileSize, signKey, sign
 	return hex.EncodeToString(tokenMd5[:])
 }
 
-func (d *Pan115) rapidUpload(fileSize int64, fileName, dirID, preID, fileID string, stream model.FileStreamer) (*driver115.UploadInitResp, error) {
+func (d *Pan115) rapidUpload(ctx context.Context, fileSize int64, fileName, dirID, preID, fileID string, stream model.FileStreamer) (*driver115.UploadInitResp, error) {
 	var (
 		ecdhCipher   *cipher.EcdhCipher
 		encrypted    []byte
@@ -196,7 +197,10 @@ func (d *Pan115) rapidUpload(fileSize int64, fileName, dirID, preID, fileID stri
 	form.Set("sig", d.client.GenerateSignature(fileID, target))
 
 	signKey, signVal := "", ""
-	for retry := true; retry; {
+	for challengeAttempts := 0; ; challengeAttempts++ {
+		if challengeAttempts >= 3 {
+			return nil, errors.New("rapid upload sign challenge exceeded retry limit")
+		}
 		t := driver115.NowMilli()
 
 		if encodedToken, err = ecdhCipher.EncodeToken(t.ToInt64()); err != nil {
@@ -218,6 +222,7 @@ func (d *Pan115) rapidUpload(fileSize int64, fileName, dirID, preID, fileID stri
 		}
 
 		req := d.client.NewRequest().
+			SetContext(ctx).
 			SetQueryParams(params).
 			SetBody(encrypted).
 			SetHeaderVerbatim("Content-Type", "application/x-www-form-urlencoded").
@@ -245,12 +250,10 @@ func (d *Pan115) rapidUpload(fileSize int64, fileName, dirID, preID, fileID stri
 				return nil, err
 			}
 		} else {
-			retry = false
+			result.SHA1 = fileID
+			return &result, nil
 		}
-		result.SHA1 = fileID
 	}
-
-	return &result, nil
 }
 
 func UploadDigestRange(stream model.FileStreamer, rangeSpec string) (result string, err error) {
@@ -273,7 +276,7 @@ func UploadDigestRange(stream model.FileStreamer, rangeSpec string) (result stri
 }
 
 // UploadByOSS use aliyun sdk to upload
-func (c *Pan115) UploadByOSS(params *driver115.UploadOSSParams, r io.Reader, dirID string) (*UploadResult, error) {
+func (c *Pan115) UploadByOSS(ctx context.Context, params *driver115.UploadOSSParams, stream model.FileStreamer, dirID string, up driver.UpdateProgress) (*UploadResult, error) {
 	ossToken, err := c.client.GetOSSToken()
 	if err != nil {
 		return nil, err
@@ -288,9 +291,10 @@ func (c *Pan115) UploadByOSS(params *driver115.UploadOSSParams, r io.Reader, dir
 	}
 
 	var bodyBytes []byte
-	if err = bucket.PutObject(params.Object, r, append(
+	if err = bucket.PutObject(params.Object, io.TeeReader(stream, driver.NewProgress(stream.GetSize(), up)), append(
 		driver115.OssOption(params, ossToken),
 		oss.CallbackResult(&bodyBytes),
+		oss.WithContext(ctx),
 	)...); err != nil {
 		return nil, err
 	}
@@ -303,7 +307,7 @@ func (c *Pan115) UploadByOSS(params *driver115.UploadOSSParams, r io.Reader, dir
 }
 
 // UploadByMultipart upload by mutipart blocks
-func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize int64, stream model.FileStreamer, dirID string, opts ...driver115.UploadMultipartOption) (*UploadResult, error) {
+func (d *Pan115) UploadByMultipart(ctx context.Context, params *driver115.UploadOSSParams, fileSize int64, stream model.FileStreamer, dirID string, up driver.UpdateProgress, opts ...driver115.UploadMultipartOption) (*UploadResult, error) {
 	var (
 		chunks    []oss.FileChunk
 		parts     []oss.UploadPart
@@ -341,11 +345,8 @@ func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize i
 		return nil, err
 	}
 
-	// ossToken一小时后就会失效，所以每50分钟重新获取一次
-	ticker := time.NewTicker(options.TokenRefreshTime)
-	defer ticker.Stop()
-	// 设置超时
-	timeout := time.NewTimer(options.Timeout)
+	uploadCtx, cancel := context.WithTimeout(ctx, options.Timeout)
+	defer cancel()
 
 	if chunks, err = SplitFile(fileSize); err != nil {
 		return nil, err
@@ -354,83 +355,49 @@ func (d *Pan115) UploadByMultipart(params *driver115.UploadOSSParams, fileSize i
 	if imur, err = bucket.InitiateMultipartUpload(params.Object,
 		oss.SetHeader(driver115.OssSecurityTokenHeaderName, ossToken.SecurityToken),
 		oss.UserAgentHeader(driver115.OSSUserAgent),
-		oss.EnableSha1(), oss.Sequential(),
+		oss.EnableSha1(), oss.Sequential(), oss.WithContext(uploadCtx),
 	); err != nil {
 		return nil, err
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(len(chunks))
-
-	chunksCh := make(chan oss.FileChunk)
-	errCh := make(chan error)
-	UploadedPartsCh := make(chan oss.UploadPart)
-	quit := make(chan struct{})
-
-	// producer
-	go chunksProducer(chunksCh, chunks)
-	go func() {
-		wg.Wait()
-		quit <- struct{}{}
-	}()
-
-	// consumers
-	for i := 0; i < options.ThreadsNum; i++ {
-		go func(threadId int) {
-			defer func() {
-				if r := recover(); r != nil {
-					errCh <- fmt.Errorf("recovered in %v", r)
-				}
-			}()
-			for chunk := range chunksCh {
-				var part oss.UploadPart // 出现错误就继续尝试，共尝试3次
-				for retry := 0; retry < 3; retry++ {
-					select {
-					case <-ticker.C:
-						if ossToken, err = d.client.GetOSSToken(); err != nil { // 到时重新获取ossToken
-							errCh <- errors.Wrap(err, "刷新token时出现错误")
-						}
-					default:
-					}
-
-					buf := make([]byte, chunk.Size)
-					if _, err = tmpF.ReadAt(buf, chunk.Offset); err != nil && !errors.Is(err, io.EOF) {
-						continue
-					}
-
-					if part, err = bucket.UploadPart(imur, bytes.NewBuffer(buf), chunk.Size, chunk.Number, driver115.OssOption(params, ossToken)...); err == nil {
-						break
-					}
-				}
-				if err != nil {
-					errCh <- errors.Wrap(err, fmt.Sprintf("上传 %s 的第%d个分片时出现错误：%v", stream.GetName(), chunk.Number, err))
-				}
-				UploadedPartsCh <- part
-			}
-		}(i)
-	}
-
-	go func() {
-		for part := range UploadedPartsCh {
-			parts = append(parts, part)
-			wg.Done()
-		}
-	}()
-LOOP:
-	for {
-		select {
-		case <-ticker.C:
-			// 到时重新获取ossToken
-			if ossToken, err = d.client.GetOSSToken(); err != nil {
-				return nil, err
-			}
-		case <-quit:
-			break LOOP
-		case <-errCh:
+	parts = make([]oss.UploadPart, len(chunks))
+	lastTokenRefresh := time.Now()
+	var uploaded int64
+	for i, chunk := range chunks {
+		if err = uploadCtx.Err(); err != nil {
 			return nil, err
-		case <-timeout.C:
-			return nil, fmt.Errorf("time out")
 		}
+		if time.Since(lastTokenRefresh) >= options.TokenRefreshTime {
+			if ossToken, err = d.client.GetOSSToken(); err != nil {
+				return nil, errors.Wrap(err, "refresh OSS token")
+			}
+			lastTokenRefresh = time.Now()
+		}
+		buf := make([]byte, chunk.Size)
+		if _, err = io.ReadFull(io.NewSectionReader(tmpF, chunk.Offset, chunk.Size), buf); err != nil {
+			return nil, errors.Wrapf(err, "read upload chunk %d", chunk.Number)
+		}
+		var part oss.UploadPart
+		for attempt := 1; attempt <= 3; attempt++ {
+			part, err = bucket.UploadPart(imur, bytes.NewReader(buf), chunk.Size, chunk.Number,
+				append(driver115.OssOption(params, ossToken), oss.WithContext(uploadCtx))...)
+			if err == nil {
+				break
+			}
+			if attempt < 3 {
+				select {
+				case <-uploadCtx.Done():
+					return nil, uploadCtx.Err()
+				case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+				}
+			}
+		}
+		if err != nil {
+			return nil, errors.Wrapf(err, "upload %s chunk %d", stream.GetName(), chunk.Number)
+		}
+		parts[i] = part
+		uploaded += chunk.Size
+		up(float64(uploaded) * 100 / float64(fileSize))
 	}
 
 	// 不知道啥原因，oss那边分片上传不计算sha1，导致115服务器校验错误
@@ -438,6 +405,7 @@ LOOP:
 	if _, err := bucket.CompleteMultipartUpload(imur, parts, append(
 		driver115.OssOption(params, ossToken),
 		oss.CallbackResult(&bodyBytes),
+		oss.WithContext(uploadCtx),
 	)...); err != nil {
 		return nil, err
 	}
@@ -449,13 +417,10 @@ LOOP:
 	return &uploadResult, uploadResult.Err(string(bodyBytes))
 }
 
-func chunksProducer(ch chan oss.FileChunk, chunks []oss.FileChunk) {
-	for _, chunk := range chunks {
-		ch <- chunk
-	}
-}
-
 func SplitFile(fileSize int64) (chunks []oss.FileChunk, err error) {
+	if fileSize <= 0 {
+		return nil, errors.New("file size must be positive")
+	}
 	for i := int64(1); i < 10; i++ {
 		if fileSize < i*utils.GB { // 文件大小小于iGB时分为i*1000片
 			if chunks, err = SplitFileByPartNum(fileSize, int(i*1000)); err != nil {
@@ -464,7 +429,7 @@ func SplitFile(fileSize int64) (chunks []oss.FileChunk, err error) {
 			break
 		}
 	}
-	if fileSize > 9*utils.GB { // 文件大小大于9GB时分为10000片
+	if fileSize >= 9*utils.GB { // 文件大小大于等于9GB时分为10000片
 		if chunks, err = SplitFileByPartNum(fileSize, 10000); err != nil {
 			return
 		}

@@ -128,7 +128,7 @@ func DefaultConfig() *Config {
 			MaxAge:     28,
 		},
 		MaxConnections:        0,
-		TlsInsecureSkipVerify: true,
+		TlsInsecureSkipVerify: false,
 		Tasks: TasksConfig{
 			Download: TaskConfig{
 				Workers:  5,

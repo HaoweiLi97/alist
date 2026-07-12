@@ -241,16 +241,23 @@ type XunLeiCommon struct {
 
 	refreshTokenFunc func() error
 	pathIDCache      sync.Map // cleaned full path -> file id
+	pathIsDirCache   sync.Map // cleaned full path -> bool
 	getObjCache      sync.Map // cleaned full path -> cachedObj
 	getObjG          singleflight.Group[model.Obj]
 }
 
 type cachedObj struct {
-	obj       model.Obj
-	expiresAt int64
+	obj            model.Obj
+	expiresAt      int64
+	staleExpiresAt int64
 }
 
-const getObjCacheTTL = 15 * time.Second
+const (
+	getObjCacheTTL             = 15 * time.Second
+	staleGetObjCacheTTL        = 5 * time.Minute
+	transientResolveRetryCount = 2
+	transientResolveRetryDelay = 250 * time.Millisecond
+)
 
 func (xc *XunLeiCommon) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
 	files, err := xc.getFiles(ctx, dir.GetID())
@@ -259,9 +266,9 @@ func (xc *XunLeiCommon) List(ctx context.Context, dir model.Obj, args model.List
 	}
 	reqPath := utils.FixAndCleanPath(args.ReqPath)
 	if reqPath != "" {
-		xc.cachePathID(reqPath, dir.GetID())
+		xc.cachePathID(reqPath, dir.GetID(), true)
 		for _, obj := range files {
-			xc.cachePathID(stdpath.Join(reqPath, obj.GetName()), obj.GetID())
+			xc.cachePathID(stdpath.Join(reqPath, obj.GetName()), obj.GetID(), obj.IsDir())
 		}
 	}
 	return files, nil
@@ -290,8 +297,16 @@ func (xc *XunLeiCommon) Get(ctx context.Context, path string) (model.Obj, error)
 		resolved, resolveErr := xc.getNoSingleflight(ctx, cleanPath)
 		if resolveErr == nil {
 			xc.storeCachedObj(cleanPath, resolved)
+			xc.cachePathID(cleanPath, resolved.GetID(), resolved.IsDir())
+			return resolved, nil
 		}
-		return resolved, resolveErr
+		if errs.IsObjectNotFound(resolveErr) {
+			if cached, ok := xc.loadStaleCachedObj(cleanPath); ok {
+				log.Warnf("[thunder.get] stale-cache fallback path=%s err=%v", cleanPath, resolveErr)
+				return cached, nil
+			}
+		}
+		return nil, resolveErr
 	})
 	if shared {
 		log.Debugf("[thunder.get] singleflight-shared path=%s", cleanPath)
@@ -305,9 +320,13 @@ func (xc *XunLeiCommon) getNoSingleflight(ctx context.Context, cleanPath string)
 	if fileID, ok := xc.loadPathID(cleanPath); ok && fileID != "" {
 		log.Debugf("[thunder.get] cache-hit path=%s id=%s", cleanPath, fileID)
 		if obj, err := xc.getByID(ctx, fileID); err == nil {
-			log.Debugf("[thunder.get] by-id success path=%s", cleanPath)
-			xc.storeCachedObj(cleanPath, obj)
-			return obj, nil
+			if xc.pathObjLooksValid(cleanPath, obj) {
+				log.Debugf("[thunder.get] by-id success path=%s", cleanPath)
+				xc.storeCachedObj(cleanPath, obj)
+				xc.cachePathID(cleanPath, obj.GetID(), obj.IsDir())
+				return obj, nil
+			}
+			log.Warnf("[thunder.get] by-id returned mismatched obj, fallback list path=%s id=%s name=%s is_dir=%v", cleanPath, fileID, obj.GetName(), obj.IsDir())
 		}
 		log.Debugf("[thunder.get] by-id failed, fallback list path=%s", cleanPath)
 	}
@@ -319,21 +338,27 @@ func (xc *XunLeiCommon) getNoSingleflight(ctx context.Context, cleanPath string)
 		return nil, err
 	}
 
-	children, err := xc.getFiles(ctx, parentID)
-	if err != nil {
-		return nil, err
-	}
-	log.Debugf("[thunder.get] fallback-list parent=%s", parentPath)
-	for _, child := range children {
-		if child.GetName() != base {
-			continue
+	for attempt := 0; attempt <= transientResolveRetryCount; attempt++ {
+		children, err := xc.getFiles(ctx, parentID)
+		if err != nil {
+			return nil, err
 		}
-		xc.cachePathID(cleanPath, child.GetID())
-		if child.IsDir() {
-			xc.cachePathID(stdpath.Join(parentPath, child.GetName()), child.GetID())
+		log.Debugf("[thunder.get] fallback-list parent=%s attempt=%d", parentPath, attempt+1)
+		for _, child := range children {
+			if child.GetName() != base {
+				continue
+			}
+			xc.cachePathID(cleanPath, child.GetID(), child.IsDir())
+			xc.storeCachedObj(cleanPath, child)
+			return child, nil
 		}
-		xc.storeCachedObj(cleanPath, child)
-		return child, nil
+		if attempt < transientResolveRetryCount {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(transientResolveRetryDelay):
+			}
+		}
 	}
 	return nil, errs.ObjectNotFound
 }
@@ -462,7 +487,7 @@ func (xc *XunLeiCommon) Put(ctx context.Context, dstDir model.Obj, stream model.
 
 	param := resp.Resumable.Params
 	if resp.UploadType == UPLOAD_TYPE_RESUMABLE {
-		param.Endpoint = strings.TrimLeft(param.Endpoint, param.Bucket+".")
+		param.Endpoint = strings.TrimPrefix(param.Endpoint, param.Bucket+".")
 		s, err := session.NewSession(&aws.Config{
 			Credentials: credentials.NewStaticCredentials(param.AccessKeyID, param.AccessKeySecret, param.SecurityToken),
 			Region:      aws.String("xunlei"),
@@ -584,12 +609,15 @@ func (xc *XunLeiCommon) getByID(ctx context.Context, fileID string) (model.Obj, 
 	return &f, nil
 }
 
-func (xc *XunLeiCommon) cachePathID(path, fileID string) {
+func (xc *XunLeiCommon) cachePathID(path, fileID string, isDir ...bool) {
 	p := utils.FixAndCleanPath(path)
 	if p == "" || fileID == "" {
 		return
 	}
 	xc.pathIDCache.Store(p, fileID)
+	if len(isDir) > 0 {
+		xc.pathIsDirCache.Store(p, isDir[0])
+	}
 }
 
 func (xc *XunLeiCommon) loadPathID(path string) (string, bool) {
@@ -601,6 +629,15 @@ func (xc *XunLeiCommon) loadPathID(path string) (string, bool) {
 	return id, ok && id != ""
 }
 
+func (xc *XunLeiCommon) loadPathIsDir(path string) (bool, bool) {
+	v, ok := xc.pathIsDirCache.Load(utils.FixAndCleanPath(path))
+	if !ok {
+		return false, false
+	}
+	isDir, ok := v.(bool)
+	return isDir, ok
+}
+
 func (xc *XunLeiCommon) loadCachedObj(path string) (model.Obj, bool) {
 	v, ok := xc.getObjCache.Load(utils.FixAndCleanPath(path))
 	if !ok {
@@ -610,7 +647,28 @@ func (xc *XunLeiCommon) loadCachedObj(path string) (model.Obj, bool) {
 	if !ok || entry.obj == nil {
 		return nil, false
 	}
-	if time.Now().UnixNano() > entry.expiresAt {
+	now := time.Now().UnixNano()
+	if now > entry.expiresAt {
+		if entry.staleExpiresAt > 0 && now <= entry.staleExpiresAt {
+			return nil, false
+		}
+		xc.getObjCache.Delete(utils.FixAndCleanPath(path))
+		return nil, false
+	}
+	return entry.obj, true
+}
+
+func (xc *XunLeiCommon) loadStaleCachedObj(path string) (model.Obj, bool) {
+	v, ok := xc.getObjCache.Load(utils.FixAndCleanPath(path))
+	if !ok {
+		return nil, false
+	}
+	entry, ok := v.(cachedObj)
+	if !ok || entry.obj == nil {
+		return nil, false
+	}
+	now := time.Now().UnixNano()
+	if entry.staleExpiresAt <= 0 || now > entry.staleExpiresAt {
 		xc.getObjCache.Delete(utils.FixAndCleanPath(path))
 		return nil, false
 	}
@@ -622,9 +680,24 @@ func (xc *XunLeiCommon) storeCachedObj(path string, obj model.Obj) {
 		return
 	}
 	xc.getObjCache.Store(utils.FixAndCleanPath(path), cachedObj{
-		obj:       obj,
-		expiresAt: time.Now().Add(getObjCacheTTL).UnixNano(),
+		obj:            obj,
+		expiresAt:      time.Now().Add(getObjCacheTTL).UnixNano(),
+		staleExpiresAt: time.Now().Add(staleGetObjCacheTTL).UnixNano(),
 	})
+}
+
+func (xc *XunLeiCommon) pathObjLooksValid(cleanPath string, obj model.Obj) bool {
+	if obj == nil {
+		return false
+	}
+	base := stdpath.Base(cleanPath)
+	if base != "." && base != "/" && obj.GetName() != "" && obj.GetName() != base {
+		return false
+	}
+	if expectedIsDir, ok := xc.loadPathIsDir(cleanPath); ok && obj.IsDir() != expectedIsDir {
+		return false
+	}
+	return true
 }
 
 func (xc *XunLeiCommon) resolveDirIDByPath(ctx context.Context, dirPath string) (string, error) {
@@ -633,7 +706,9 @@ func (xc *XunLeiCommon) resolveDirIDByPath(ctx context.Context, dirPath string) 
 		return "", nil
 	}
 	if id, ok := xc.loadPathID(cleanPath); ok {
-		return id, nil
+		if isDir, known := xc.loadPathIsDir(cleanPath); !known || isDir {
+			return id, nil
+		}
 	}
 
 	parts := strings.Split(strings.TrimPrefix(cleanPath, "/"), "/")
@@ -645,24 +720,39 @@ func (xc *XunLeiCommon) resolveDirIDByPath(ctx context.Context, dirPath string) 
 		}
 		nextPath := stdpath.Join(curPath, part)
 		if cachedID, ok := xc.loadPathID(nextPath); ok {
+			if isDir, known := xc.loadPathIsDir(nextPath); known && !isDir {
+				return "", errs.ObjectNotFound
+			}
 			curPath = nextPath
 			curID = cachedID
 			continue
 		}
-		items, err := xc.getFiles(ctx, curID)
-		if err != nil {
-			return "", err
-		}
 		found := false
-		for _, item := range items {
-			if item.GetName() != part || !item.IsDir() {
-				continue
+		for attempt := 0; attempt <= transientResolveRetryCount; attempt++ {
+			items, err := xc.getFiles(ctx, curID)
+			if err != nil {
+				return "", err
 			}
-			curID = item.GetID()
-			curPath = nextPath
-			xc.cachePathID(curPath, curID)
-			found = true
-			break
+			for _, item := range items {
+				if item.GetName() != part || !item.IsDir() {
+					continue
+				}
+				curID = item.GetID()
+				curPath = nextPath
+				xc.cachePathID(curPath, curID, true)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+			if attempt < transientResolveRetryCount {
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-time.After(transientResolveRetryDelay):
+				}
+			}
 		}
 		if !found {
 			return "", errs.ObjectNotFound

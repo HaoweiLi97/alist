@@ -1,0 +1,290 @@
+import AppKit
+import ServiceManagement
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let processController = AListProcessController()
+    private var browserWindowController: BrowserWindowController?
+    private var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
+    private var launchAtLoginMenuItem: NSMenuItem?
+    private var allowLANAccessMenuItem: NSMenuItem?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        configureStatusItem()
+        updateLaunchAtLoginMenuItem()
+
+        Task {
+            do {
+                let url = try await processController.start()
+                browserWindowController?.loadApp(at: url)
+            } catch {
+                presentStartupError(error)
+            }
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openAList(nil)
+        return true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task {
+            await processController.stop()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
+    private func configureStatusItem() {
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let statusImage = loadStatusBarImage()
+        statusItem.button?.image = statusImage
+        statusItem.button?.imagePosition = .imageOnly
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(handleStatusItemClick(_:))
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        self.statusItem = statusItem
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.addItem(NSMenuItem(title: "Open AList", action: #selector(openAList(_:)), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem(title: "Open in Browser", action: #selector(openInBrowser(_:)), keyEquivalent: "b"))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Restart Service", action: #selector(restartService(_:)), keyEquivalent: "r"))
+        menu.addItem(NSMenuItem(title: "Show Data Directory", action: #selector(showDataDirectory(_:)), keyEquivalent: "d"))
+        menu.addItem(NSMenuItem(title: "Show Logs Directory", action: #selector(showLogsDirectory(_:)), keyEquivalent: "l"))
+        menu.addItem(NSMenuItem.separator())
+        let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
+        launchAtLoginItem.state = .off
+        menu.addItem(launchAtLoginItem)
+        self.launchAtLoginMenuItem = launchAtLoginItem
+        let allowLANAccessItem = NSMenuItem(title: "Allow LAN Access", action: #selector(toggleAllowLANAccess(_:)), keyEquivalent: "")
+        allowLANAccessItem.state = processController.allowsLANAccess ? .on : .off
+        menu.addItem(allowLANAccessItem)
+        allowLANAccessMenuItem = allowLANAccessItem
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApplication(_:)), keyEquivalent: "q"))
+
+        for item in menu.items where item.action != nil {
+            item.target = self
+        }
+
+        self.statusMenu = menu
+    }
+
+    private func loadStatusBarImage() -> NSImage {
+        if
+            let resourceURL = Bundle.main.resourceURL?.appendingPathComponent("MenuBarIcon.png"),
+            let image = NSImage(contentsOf: resourceURL)
+        {
+            image.size = NSSize(width: 18, height: 18)
+            image.isTemplate = true
+            return image
+        }
+
+        let fallback = NSImage(
+            systemSymbolName: "externaldrive.badge.wifi",
+            accessibilityDescription: "AList"
+        ) ?? NSImage()
+        fallback.isTemplate = true
+        return fallback
+    }
+
+    private func ensureBrowserWindowController() -> BrowserWindowController {
+        if let browserWindowController {
+            return browserWindowController
+        }
+
+        let controller = BrowserWindowController()
+        controller.onOpenLogs = { [weak self] in
+            self?.showLogsDirectory(nil)
+        }
+        controller.onOpenBrowser = { [weak self] in
+            self?.openInBrowser(nil)
+        }
+        controller.onRestartService = { [weak self] in
+            self?.restartService(nil)
+        }
+        browserWindowController = controller
+        return controller
+    }
+
+    private func presentStartupError(_ error: Error) {
+        let controller = ensureBrowserWindowController()
+        controller.showError(
+            title: "AList failed to start",
+            message: error.localizedDescription
+        )
+        controller.showWindowAndActivate()
+    }
+
+    @objc
+    private func handleStatusItemClick(_ sender: Any?) {
+        guard let event = NSApp.currentEvent else {
+            openAList(nil)
+            return
+        }
+
+        if event.type == .rightMouseUp, let button = statusItem?.button, let statusMenu {
+            NSMenu.popUpContextMenu(statusMenu, with: event, for: button)
+            return
+        }
+
+        openAList(nil)
+    }
+
+    @objc
+    private func openAList(_ sender: Any?) {
+        let controller = ensureBrowserWindowController()
+        controller.showLoading(status: "Starting AList...")
+        controller.showWindowAndActivate()
+
+        Task {
+            do {
+                let url = try await processController.start()
+                controller.loadApp(at: url)
+                controller.showWindowAndActivate()
+            } catch {
+                controller.showError(
+                    title: "AList failed to start",
+                    message: error.localizedDescription
+                )
+                controller.showWindowAndActivate()
+            }
+        }
+    }
+
+    @objc
+    private func openInBrowser(_ sender: Any?) {
+        Task {
+            do {
+                let url = try await processController.start()
+                NSWorkspace.shared.open(url)
+            } catch {
+                presentStartupError(error)
+            }
+        }
+    }
+
+    @objc
+    private func restartService(_ sender: Any?) {
+        let controller = ensureBrowserWindowController()
+        controller.showLoading(status: "Restarting AList...")
+        controller.showWindowAndActivate()
+
+        Task {
+            do {
+                let url = try await processController.restart()
+                controller.loadApp(at: url)
+                controller.showWindowAndActivate()
+            } catch {
+                controller.showError(
+                    title: "AList failed to restart",
+                    message: error.localizedDescription
+                )
+                controller.showWindowAndActivate()
+            }
+        }
+    }
+
+    @objc
+    private func showDataDirectory(_ sender: Any?) {
+        NSWorkspace.shared.activateFileViewerSelecting([processController.runtimeRoot])
+    }
+
+    @objc
+    private func showLogsDirectory(_ sender: Any?) {
+        NSWorkspace.shared.activateFileViewerSelecting([processController.logsDirectory])
+    }
+
+    @objc
+    private func toggleLaunchAtLogin(_ sender: Any?) {
+        Task {
+            do {
+                try toggleLaunchAtLogin()
+                updateLaunchAtLoginMenuItem()
+            } catch {
+                presentStartupError(error)
+            }
+        }
+    }
+
+    private func toggleLaunchAtLogin() throws {
+        guard #available(macOS 13.0, *) else {
+            throw DesktopHostError.launchAtLoginUnavailable
+        }
+
+        let service = SMAppService.mainApp
+        switch service.status {
+        case .enabled:
+            try service.unregister()
+        case .notRegistered, .requiresApproval, .notFound:
+            try service.register()
+        @unknown default:
+            try service.register()
+        }
+    }
+
+    private func updateLaunchAtLoginMenuItem() {
+        guard let item = launchAtLoginMenuItem else { return }
+
+        guard #available(macOS 13.0, *) else {
+            item.isEnabled = false
+            item.state = .off
+            return
+        }
+
+        item.isEnabled = true
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            item.state = .on
+        case .requiresApproval, .notFound, .notRegistered:
+            item.state = .off
+        @unknown default:
+            item.state = .off
+        }
+    }
+
+    private func updateAllowLANAccessMenuItem() {
+        allowLANAccessMenuItem?.state = processController.allowsLANAccess ? .on : .off
+    }
+
+    @objc
+    private func toggleAllowLANAccess(_ sender: Any?) {
+        let previousValue = processController.allowsLANAccess
+        let nextValue = !previousValue
+        processController.allowsLANAccess = nextValue
+        updateAllowLANAccessMenuItem()
+
+        let controller = ensureBrowserWindowController()
+        controller.showLoading(status: nextValue ? "Enabling LAN access..." : "Disabling LAN access...")
+        controller.showWindowAndActivate()
+
+        Task {
+            do {
+                let url = try await processController.restart()
+                controller.loadApp(at: url)
+                controller.showWindowAndActivate()
+            } catch {
+                processController.allowsLANAccess = previousValue
+                updateAllowLANAccessMenuItem()
+                controller.showError(
+                    title: "Failed to update LAN access",
+                    message: error.localizedDescription
+                )
+                controller.showWindowAndActivate()
+            }
+        }
+    }
+
+    @objc
+    private func quitApplication(_ sender: Any?) {
+        NSApp.terminate(nil)
+    }
+}

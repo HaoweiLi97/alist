@@ -1,0 +1,5 @@
+macos/.build/
+macos/build/
+windows/bin/
+windows/obj/
+windows/build/

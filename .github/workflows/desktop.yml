@@ -1,0 +1,140 @@
+name: desktop
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop/**'
+      - 'scripts/build-alist-desktop-*'
+      - '.github/workflows/desktop.yml'
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'desktop/**'
+      - 'scripts/build-alist-desktop-*'
+      - '.github/workflows/desktop.yml'
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+env:
+  DESKTOP_VERSION: ${{ github.event.release.tag_name || github.sha }}
+
+jobs:
+  macos:
+    name: macOS universal desktop
+    runs-on: macos-15
+    env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install icon tooling
+        run: brew install librsvg
+
+      - name: Import Developer ID certificate
+        if: ${{ env.MACOS_CERTIFICATE_P12_BASE64 != '' }}
+        env:
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Build macOS desktop
+        env:
+          ALIST_DESKTOP_VERSION: ${{ env.DESKTOP_VERSION }}
+          ALIST_DESKTOP_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          ALIST_DESKTOP_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          ALIST_DESKTOP_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          ALIST_DESKTOP_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          chmod +x scripts/build-alist-desktop-macos.sh
+          scripts/build-alist-desktop-macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alist-desktop-macos-universal
+          path: |
+            desktop/macos/build/*.zip
+            desktop/macos/build/*.dmg
+          if-no-files-found: error
+
+      - name: Upload macOS release assets
+        if: ${{ github.event_name == 'release' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            desktop/macos/build/*.zip
+            desktop/macos/build/*.dmg
+
+  windows:
+    name: Windows x64 desktop
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install MinGW for SQLite
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build Windows desktop
+        shell: powershell
+        env:
+          ALIST_DESKTOP_VERSION: ${{ env.DESKTOP_VERSION }}
+          CC: C:\msys64\mingw64\bin\gcc.exe
+        run: scripts/build-alist-desktop-windows.ps1 -Runtime win-x64 -Version $env:ALIST_DESKTOP_VERSION
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alist-desktop-windows-x64
+          path: desktop/windows/build/*.zip
+          if-no-files-found: error
+
+      - name: Upload Windows release asset
+        if: ${{ github.event_name == 'release' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktop/windows/build/*.zip
