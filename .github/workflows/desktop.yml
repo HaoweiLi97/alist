@@ -11,6 +11,15 @@ on:
         description: Git ref to package
         required: false
         default: ''
+      platform:
+        description: Desktop platform to build
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - macos
+          - windows
   push:
     branches: [main]
     paths:
@@ -45,6 +54,7 @@ env:
 jobs:
   macos:
     name: macOS universal desktop
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: macos-15
     env:
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -108,6 +118,7 @@ jobs:
 
   windows:
     name: Windows x64 desktop
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +136,7 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Install MinGW for SQLite
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           location: C:\msys64
@@ -136,7 +148,7 @@ jobs:
         shell: powershell
         env:
           ALIST_DESKTOP_VERSION: ${{ env.DESKTOP_VERSION }}
-          CC: C:\msys64\mingw64\bin\gcc.exe
+          CC: ${{ steps.msys2.outputs.msys2-location }}\mingw64\bin\gcc.exe
         run: scripts/build-alist-desktop-windows.ps1 -Runtime win-x64 -Version $env:ALIST_DESKTOP_VERSION
 
       - uses: actions/upload-artifact@v4
