@@ -9,6 +9,13 @@ using System.Text.Json.Nodes;
 
 namespace AListDesktop.Windows;
 
+internal sealed class PreferredPortUnavailableException : InvalidOperationException
+{
+    public PreferredPortUnavailableException() : base("Port 5244 is already in use.")
+    {
+    }
+}
+
 internal sealed class AListProcessController
 {
     private const int PortStart = 5244;
@@ -64,7 +71,7 @@ internal sealed class AListProcessController
 
     private string BindingHost => AllowsLanAccess ? "0.0.0.0" : "127.0.0.1";
 
-    public Task<Uri> StartAsync(CancellationToken cancellationToken = default)
+    public Task<Uri> StartAsync(bool allowFallbackPort = false, CancellationToken cancellationToken = default)
     {
         lock (_sync)
         {
@@ -78,15 +85,15 @@ internal sealed class AListProcessController
                 return Task.FromResult(CurrentServiceUrl);
             }
 
-            _activeStartTask = StartInternalAsync(cancellationToken);
+            _activeStartTask = StartInternalAsync(allowFallbackPort, cancellationToken);
             return _activeStartTask;
         }
     }
 
-    public async Task<Uri> RestartAsync(CancellationToken cancellationToken = default)
+    public async Task<Uri> RestartAsync(bool allowFallbackPort = false, CancellationToken cancellationToken = default)
     {
         await StopAsync();
-        return await StartAsync(cancellationToken);
+        return await StartAsync(allowFallbackPort, cancellationToken);
     }
 
     public async Task StopAsync()
@@ -132,7 +139,7 @@ internal sealed class AListProcessController
         CleanupAfterExit();
     }
 
-    private async Task<Uri> StartInternalAsync(CancellationToken cancellationToken)
+    private async Task<Uri> StartInternalAsync(bool allowFallbackPort, CancellationToken cancellationToken)
     {
         try
         {
@@ -141,7 +148,7 @@ internal sealed class AListProcessController
             var binaryPath = ResolveEmbeddedAListPath();
             TerminateOrphanedManagedProcessIfNeeded(binaryPath);
 
-            var port = ChoosePort();
+            var port = ChoosePort(allowFallbackPort);
             var serviceUrl = new Uri($"http://127.0.0.1:{port}/");
             WriteRuntimeConfiguration(port, serviceUrl);
 
@@ -196,7 +203,7 @@ internal sealed class AListProcessController
 
             try
             {
-                await WaitUntilReadyAsync(serviceUrl, TimeSpan.FromSeconds(15), cancellationToken);
+                await WaitUntilReadyAsync(serviceUrl, process, cancellationToken);
                 AppendHostLog($"AList became ready at {serviceUrl}");
                 return serviceUrl;
             }
@@ -286,9 +293,19 @@ internal sealed class AListProcessController
         AppendHostLog($"Wrote runtime config to {ConfigPath}");
     }
 
-    private int ChoosePort()
+    private int ChoosePort(bool allowFallbackPort)
     {
-        for (var port = PortStart; port <= PortEnd; port += 1)
+        if (IsPortAvailable(PortStart))
+        {
+            return PortStart;
+        }
+
+        if (!allowFallbackPort)
+        {
+            throw new PreferredPortUnavailableException();
+        }
+
+        for (var port = PortStart + 1; port <= PortEnd; port += 1)
         {
             if (IsPortAvailable(port))
             {
@@ -296,7 +313,7 @@ internal sealed class AListProcessController
             }
         }
 
-        throw new InvalidOperationException("No available local port was found in the range 5244-5264.");
+        throw new InvalidOperationException("No available local port was found in the range 5245-5264.");
     }
 
     private bool IsPortAvailable(int port)
@@ -314,13 +331,12 @@ internal sealed class AListProcessController
         }
     }
 
-    private async Task WaitUntilReadyAsync(Uri serviceUrl, TimeSpan timeout, CancellationToken cancellationToken)
+    private async Task WaitUntilReadyAsync(Uri serviceUrl, Process process, CancellationToken cancellationToken)
     {
-        var deadline = DateTimeOffset.UtcNow.Add(timeout);
-        while (DateTimeOffset.UtcNow < deadline)
+        while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (_process is { HasExited: true })
+            if (process.HasExited)
             {
                 throw new InvalidOperationException("The AList process exited before becoming ready.");
             }
@@ -339,8 +355,6 @@ internal sealed class AListProcessController
 
             await Task.Delay(250, cancellationToken);
         }
-
-        throw new TimeoutException($"AList did not become ready within {timeout.TotalSeconds:0} seconds. Check the logs in {LogsDirectory}.");
     }
 
     private void TerminateOrphanedManagedProcessIfNeeded(string binaryPath)

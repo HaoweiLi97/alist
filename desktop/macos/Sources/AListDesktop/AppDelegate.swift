@@ -16,7 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             do {
-                let url = try await processController.start()
+                let url = try await startWithPortRecovery()
                 browserWindowController?.loadApp(at: url)
             } catch {
                 presentStartupError(error)
@@ -124,6 +124,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.showWindowAndActivate()
     }
 
+    private func startWithPortRecovery(restarting: Bool = false) async throws -> URL {
+        var shouldRestart = restarting
+        while true {
+            do {
+                if shouldRestart {
+                    return try await processController.restart()
+                }
+                return try await processController.start()
+            } catch DesktopHostError.preferredPortUnavailable {
+                shouldRestart = false
+                if shouldUseAnotherPort() {
+                    return try await processController.start(allowFallbackPort: true)
+                }
+            }
+        }
+    }
+
+    private func shouldUseAnotherPort() -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Port 5244 is already in use"
+        alert.informativeText = "AList can use another available port, or retry port 5244 after you close the program using it."
+        alert.addButton(withTitle: "Use Another Port")
+        alert.addButton(withTitle: "Retry 5244")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     @objc
     private func handleStatusItemClick(_ sender: Any?) {
         guard let event = NSApp.currentEvent else {
@@ -147,7 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             do {
-                let url = try await processController.start()
+                let url = try await startWithPortRecovery()
                 controller.loadApp(at: url)
                 controller.showWindowAndActivate()
             } catch {
@@ -164,7 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func openInBrowser(_ sender: Any?) {
         Task {
             do {
-                let url = try await processController.start()
+                let url = try await startWithPortRecovery()
                 NSWorkspace.shared.open(url)
             } catch {
                 presentStartupError(error)
@@ -180,7 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             do {
-                let url = try await processController.restart()
+                let url = try await startWithPortRecovery(restarting: true)
                 controller.loadApp(at: url)
                 controller.showWindowAndActivate()
             } catch {
@@ -268,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             do {
-                let url = try await processController.restart()
+                let url = try await startWithPortRecovery(restarting: true)
                 controller.loadApp(at: url)
                 controller.showWindowAndActivate()
             } catch {

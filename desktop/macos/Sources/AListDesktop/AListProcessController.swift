@@ -4,9 +4,9 @@ import Darwin
 enum DesktopHostError: LocalizedError {
     case missingEmbeddedBinary(URL)
     case invalidConfiguration(URL)
+    case preferredPortUnavailable
     case noAvailablePort
     case failedToLaunch(String)
-    case timedOut(URL)
     case launchAtLoginUnavailable
 
     var errorDescription: String? {
@@ -15,12 +15,12 @@ enum DesktopHostError: LocalizedError {
             return "The embedded AList binary was not found at \(url.path). Rebuild the app bundle before launching."
         case .invalidConfiguration(let url):
             return "The AList configuration file is invalid JSON: \(url.path)"
+        case .preferredPortUnavailable:
+            return "Port 5244 is already in use."
         case .noAvailablePort:
-            return "No available local port was found in the range 5244-5264."
+            return "No available local port was found in the range 5245-5264."
         case .failedToLaunch(let reason):
             return "AList failed to launch: \(reason)"
-        case .timedOut(let logURL):
-            return "AList did not become ready within 15 seconds. Check the logs in \(logURL.path)."
         case .launchAtLoginUnavailable:
             return "Launch at Login requires macOS 13 or newer."
         }
@@ -69,7 +69,7 @@ final class AListProcessController {
         allowsLANAccess ? "0.0.0.0" : "127.0.0.1"
     }
 
-    func start() async throws -> URL {
+    func start(allowFallbackPort: Bool = false) async throws -> URL {
         if let activeStartTask {
             return try await activeStartTask.value
         }
@@ -79,16 +79,16 @@ final class AListProcessController {
         }
 
         let task = Task { @MainActor () throws -> URL in
-            try await self.startImpl()
+            try await self.startImpl(allowFallbackPort: allowFallbackPort)
         }
         activeStartTask = task
         defer { activeStartTask = nil }
         return try await task.value
     }
 
-    func restart() async throws -> URL {
+    func restart(allowFallbackPort: Bool = false) async throws -> URL {
         await stop()
-        return try await start()
+        return try await start(allowFallbackPort: allowFallbackPort)
     }
 
     func stop() async {
@@ -116,11 +116,11 @@ final class AListProcessController {
         cleanupAfterExit()
     }
 
-    private func startImpl() async throws -> URL {
+    private func startImpl(allowFallbackPort: Bool) async throws -> URL {
         try ensureRuntimeDirectories()
         try terminateOrphanedManagedProcessIfNeeded()
 
-        let port = try prepareRuntimeConfiguration()
+        let port = try prepareRuntimeConfiguration(allowFallbackPort: allowFallbackPort)
         let serviceURL = URL(string: "http://127.0.0.1:\(port)")!
         let binaryURL = try resolveEmbeddedBinaryURL()
 
@@ -155,7 +155,7 @@ final class AListProcessController {
         try String(process.processIdentifier).write(to: pidFileURL, atomically: true, encoding: .utf8)
 
         do {
-            try await waitUntilReady(at: serviceURL, timeout: 15)
+            try await waitUntilReady(at: serviceURL, process: process)
             appendHostLog("AList became ready at \(serviceURL.absoluteString)")
             return serviceURL
         } catch {
@@ -207,9 +207,9 @@ final class AListProcessController {
         throw DesktopHostError.missingEmbeddedBinary(fallback)
     }
 
-    private func prepareRuntimeConfiguration() throws -> Int {
+    private func prepareRuntimeConfiguration(allowFallbackPort: Bool) throws -> Int {
         let fileManager = FileManager.default
-        let port = try choosePort()
+        let port = try choosePort(allowFallbackPort: allowFallbackPort)
 
         var root: [String: Any] = [:]
         if fileManager.fileExists(atPath: configURL.path) {
@@ -241,9 +241,14 @@ final class AListProcessController {
         return port
     }
 
-    private func choosePort() throws -> Int {
-        let preferredPorts = [5244] + Array(5245...5264)
-        for port in preferredPorts where isPortAvailable(port) {
+    private func choosePort(allowFallbackPort: Bool) throws -> Int {
+        if isPortAvailable(5244) {
+            return 5244
+        }
+        guard allowFallbackPort else {
+            throw DesktopHostError.preferredPortUnavailable
+        }
+        for port in 5245...5264 where isPortAvailable(port) {
             return port
         }
         throw DesktopHostError.noAvailablePort
@@ -272,13 +277,12 @@ final class AListProcessController {
         return result == 0
     }
 
-    private func waitUntilReady(at serviceURL: URL, timeout: TimeInterval) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+    private func waitUntilReady(at serviceURL: URL, process: Process) async throws {
+        while true {
             if Task.isCancelled {
                 throw CancellationError()
             }
-            if let process, !process.isRunning {
+            if !process.isRunning {
                 throw DesktopHostError.failedToLaunch("the AList process exited before becoming ready")
             }
             if await isServiceReachable(at: serviceURL) {
@@ -286,7 +290,6 @@ final class AListProcessController {
             }
             try await Task.sleep(for: .milliseconds(250))
         }
-        throw DesktopHostError.timedOut(logsDirectory)
     }
 
     private func isServiceReachable(at serviceURL: URL) async -> Bool {

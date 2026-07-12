@@ -35,7 +35,7 @@ public partial class App : System.Windows.Application
 
         try
         {
-            await _processController.StartAsync();
+            await StartWithPortRecoveryAsync();
         }
         catch (Exception error)
         {
@@ -113,6 +113,38 @@ public partial class App : System.Windows.Application
         };
     }
 
+    private async Task<Uri> StartWithPortRecoveryAsync(bool restarting = false)
+    {
+        if (_processController is null)
+        {
+            throw new InvalidOperationException("The AList process controller is unavailable.");
+        }
+
+        var shouldRestart = restarting;
+        while (true)
+        {
+            try
+            {
+                return shouldRestart
+                    ? await _processController.RestartAsync()
+                    : await _processController.StartAsync();
+            }
+            catch (PreferredPortUnavailableException)
+            {
+                shouldRestart = false;
+                var choice = System.Windows.MessageBox.Show(
+                    "Port 5244 is already in use.\n\nChoose Yes to use another available port, or No to retry port 5244 after you close the program using it.",
+                    "AList port is in use",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+                if (choice == MessageBoxResult.Yes)
+                {
+                    return await _processController.StartAsync(allowFallbackPort: true);
+                }
+            }
+        }
+    }
+
     private async Task OpenInBrowserAsync()
     {
         if (_processController is null)
@@ -123,7 +155,7 @@ public partial class App : System.Windows.Application
         Uri serviceUrl;
         try
         {
-            serviceUrl = _processController.CurrentServiceUrl ?? await _processController.StartAsync();
+            serviceUrl = _processController.CurrentServiceUrl ?? await StartWithPortRecoveryAsync();
         }
         catch (Exception error)
         {
@@ -158,7 +190,7 @@ public partial class App : System.Windows.Application
 
         try
         {
-            await _processController.RestartAsync();
+            await StartWithPortRecoveryAsync(restarting: true);
             if (_allowLanAccessItem is not null)
             {
                 _allowLanAccessItem.Checked = _processController.AllowsLanAccess;
@@ -204,7 +236,7 @@ public partial class App : System.Windows.Application
         try
         {
             _processController.AllowsLanAccess = !_processController.AllowsLanAccess;
-            await _processController.RestartAsync();
+            await StartWithPortRecoveryAsync(restarting: true);
             if (_allowLanAccessItem is not null)
             {
                 _allowLanAccessItem.Checked = _processController.AllowsLanAccess;
