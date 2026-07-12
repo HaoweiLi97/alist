@@ -4,6 +4,9 @@
 curl -fsSL https://raw.githubusercontent.com/HaoweiLi97/alist/main/scripts/one-click-alist-deploy.sh | bash
 ```
 
+已安装后再次运行同一命令会自动拉取最新镜像并更新容器，原有
+`docker-compose.yml` 和 `data` 数据目录都会保留。
+
 <div align="center">
   <a href="https://alist.nn.ci"><img width="100px" alt="logo" src="https://cdn.jsdelivr.net/gh/alist-org/logo@main/logo.svg"/></a>
   <p><em>🗂一个支持多存储的文件列表程序，使用 Gin 和 Solidjs。</em></p>

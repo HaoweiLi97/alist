@@ -4,6 +4,9 @@
 curl -fsSL https://raw.githubusercontent.com/HaoweiLi97/alist/main/scripts/one-click-alist-deploy.sh | bash
 ```
 
+Run the same command again to pull the latest image and update the existing
+container. The compose file and `data` directory are preserved automatically.
+
 <div align="center">
   <a href="https://alist.nn.ci"><img width="100px" alt="logo" src="https://cdn.jsdelivr.net/gh/alist-org/logo@main/logo.svg"/></a>
   <p><em>🗂️A file list program that supports multiple storages, powered by Gin and Solidjs.</em></p>
