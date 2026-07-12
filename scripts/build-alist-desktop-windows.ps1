@@ -36,6 +36,7 @@ if ($env:ALIST_DESKTOP_ALIST_BINARY) {
         go build -tags=jsoniter -trimpath `
             -ldflags="-s -w -X github.com/alist-org/alist/v3/internal/conf.Version=$Version" `
             -o $ServerBinary .
+        if ($LASTEXITCODE -ne 0) { throw "AList server build failed with exit code $LASTEXITCODE" }
     } finally {
         Pop-Location
     }
@@ -50,6 +51,7 @@ dotnet publish (Join-Path $Desktop "AListDesktop.Windows.csproj") `
     -p:DebugSymbols=false `
     -p:Version=$DotNetVersion `
     --output $Publish
+if ($LASTEXITCODE -ne 0) { throw "Desktop host publish failed with exit code $LASTEXITCODE" }
 
 $BundledServer = Join-Path $Publish "Assets\bin\alist.exe"
 New-Item (Split-Path $BundledServer) -ItemType Directory -Force | Out-Null

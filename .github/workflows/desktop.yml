@@ -145,11 +145,14 @@ jobs:
           install: mingw-w64-x86_64-gcc
 
       - name: Build Windows desktop
-        shell: powershell
+        shell: pwsh
         env:
           ALIST_DESKTOP_VERSION: ${{ env.DESKTOP_VERSION }}
-          CC: ${{ steps.msys2.outputs.msys2-location }}\mingw64\bin\gcc.exe
-        run: scripts/build-alist-desktop-windows.ps1 -Runtime win-x64 -Version $env:ALIST_DESKTOP_VERSION
+        run: |
+          $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
+          $env:CC = "gcc"
+          gcc --version
+          scripts/build-alist-desktop-windows.ps1 -Runtime win-x64 -Version $env:ALIST_DESKTOP_VERSION
 
       - uses: actions/upload-artifact@v4
         with:
