@@ -3,9 +3,9 @@ import Darwin
 
 enum DesktopHostError: LocalizedError {
     case missingEmbeddedBinary(URL)
-    case invalidConfiguration(URL)
     case preferredPortUnavailable
     case noAvailablePort
+    case startupTimedOut(TimeInterval)
     case failedToLaunch(String)
     case launchAtLoginUnavailable
 
@@ -13,12 +13,12 @@ enum DesktopHostError: LocalizedError {
         switch self {
         case .missingEmbeddedBinary(let url):
             return "The embedded AList binary was not found at \(url.path). Rebuild the app bundle before launching."
-        case .invalidConfiguration(let url):
-            return "The AList configuration file is invalid JSON: \(url.path)"
         case .preferredPortUnavailable:
             return "Port 5244 is already in use."
         case .noAvailablePort:
             return "No available local port was found in the range 5245-5264."
+        case .startupTimedOut(let timeout):
+            return "AList did not become ready within \(Int(timeout)) seconds. Check the desktop logs for details."
         case .failedToLaunch(let reason):
             return "AList failed to launch: \(reason)"
         case .launchAtLoginUnavailable:
@@ -27,16 +27,24 @@ enum DesktopHostError: LocalizedError {
     }
 }
 
+private struct ManagedProcessRecord: Codable {
+    let pid: Int32
+    let executablePath: String
+}
+
 @MainActor
 final class AListProcessController {
     private static let allowLANAccessDefaultsKey = "AListDesktop.allowLANAccess"
+    private static let startupTimeout: TimeInterval = 30
+    private static let processPathBufferSize = 4096
+    private static let maximumDesktopLogSize = 2 * 1024 * 1024
+    private static let desktopLogBackups = 3
 
     let runtimeRoot: URL
     let dataDirectory: URL
     let logsDirectory: URL
 
     private let runDirectory: URL
-    private let configURL: URL
     private let pidFileURL: URL
     private let hostLogURL: URL
     private let processLogURL: URL
@@ -45,6 +53,7 @@ final class AListProcessController {
     private var processLogHandle: FileHandle?
     private var activeStartTask: Task<URL, Error>?
     private(set) var currentServiceURL: URL?
+    private var initialAdminPassword: String?
     private let defaults: UserDefaults
 
     init(fileManager: FileManager = .default, defaults: UserDefaults = .standard) {
@@ -54,7 +63,6 @@ final class AListProcessController {
         dataDirectory = runtimeRoot.appendingPathComponent("data", isDirectory: true)
         logsDirectory = runtimeRoot.appendingPathComponent("logs", isDirectory: true)
         runDirectory = runtimeRoot.appendingPathComponent("run", isDirectory: true)
-        configURL = dataDirectory.appendingPathComponent("config.json", isDirectory: false)
         pidFileURL = runDirectory.appendingPathComponent("alist.pid", isDirectory: false)
         hostLogURL = logsDirectory.appendingPathComponent("desktop.log", isDirectory: false)
         processLogURL = logsDirectory.appendingPathComponent("alist.log", isDirectory: false)
@@ -91,6 +99,11 @@ final class AListProcessController {
         return try await start(allowFallbackPort: allowFallbackPort)
     }
 
+    func takeInitialAdminPassword() -> String? {
+        defer { initialAdminPassword = nil }
+        return initialAdminPassword
+    }
+
     func stop() async {
         activeStartTask?.cancel()
         activeStartTask = nil
@@ -120,7 +133,7 @@ final class AListProcessController {
         try ensureRuntimeDirectories()
         try terminateOrphanedManagedProcessIfNeeded()
 
-        let port = try prepareRuntimeConfiguration(allowFallbackPort: allowFallbackPort)
+        let port = try choosePort(allowFallbackPort: allowFallbackPort)
         let serviceURL = URL(string: "http://127.0.0.1:\(port)")!
         let binaryURL = try resolveEmbeddedBinaryURL()
 
@@ -133,7 +146,7 @@ final class AListProcessController {
         process.currentDirectoryURL = dataDirectory
         process.standardOutput = handle
         process.standardError = handle
-        process.environment = mergedEnvironment()
+        process.environment = mergedEnvironment(port: port)
         process.terminationHandler = { [weak self] _ in
             Task { @MainActor in
                 self?.appendHostLog("AList process exited")
@@ -152,7 +165,7 @@ final class AListProcessController {
         self.process = process
         self.processLogHandle = handle
         self.currentServiceURL = serviceURL
-        try String(process.processIdentifier).write(to: pidFileURL, atomically: true, encoding: .utf8)
+        try writeManagedProcessRecord(pid: process.processIdentifier, executableURL: binaryURL)
 
         do {
             try await waitUntilReady(at: serviceURL, process: process)
@@ -175,10 +188,20 @@ final class AListProcessController {
 
     private func ensureRuntimeDirectories() throws {
         let fileManager = FileManager.default
-        try fileManager.createDirectory(at: runtimeRoot, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: runDirectory, withIntermediateDirectories: true)
+        for directory in [
+            runtimeRoot,
+            dataDirectory,
+            dataDirectory.appendingPathComponent("temp", isDirectory: true),
+            logsDirectory,
+            runDirectory,
+        ] {
+            try fileManager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
     }
 
     private func resolveEmbeddedBinaryURL() throws -> URL {
@@ -205,40 +228,6 @@ final class AListProcessController {
             return fallback
         }
         throw DesktopHostError.missingEmbeddedBinary(fallback)
-    }
-
-    private func prepareRuntimeConfiguration(allowFallbackPort: Bool) throws -> Int {
-        let fileManager = FileManager.default
-        let port = try choosePort(allowFallbackPort: allowFallbackPort)
-
-        var root: [String: Any] = [:]
-        if fileManager.fileExists(atPath: configURL.path) {
-            let data = try Data(contentsOf: configURL)
-            if !data.isEmpty {
-                let json = try JSONSerialization.jsonObject(with: data, options: [])
-                guard let object = json as? [String: Any] else {
-                    appendHostLog("Configuration is not a JSON object")
-                    throw DesktopHostError.invalidConfiguration(configURL)
-                }
-                root = object
-            }
-        }
-
-        var scheme = root["scheme"] as? [String: Any] ?? [:]
-        scheme["address"] = bindingHost
-        scheme["http_port"] = port
-        scheme["https_port"] = -1
-        root["scheme"] = scheme
-        if allowsLANAccess {
-            root.removeValue(forKey: "site_url")
-        } else {
-            root["site_url"] = "http://127.0.0.1:\(port)"
-        }
-
-        let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: configURL, options: .atomic)
-        appendHostLog("Wrote runtime config to \(configURL.path)")
-        return port
     }
 
     private func choosePort(allowFallbackPort: Bool) throws -> Int {
@@ -278,6 +267,7 @@ final class AListProcessController {
     }
 
     private func waitUntilReady(at serviceURL: URL, process: Process) async throws {
+        let deadline = Date().addingTimeInterval(Self.startupTimeout)
         while true {
             if Task.isCancelled {
                 throw CancellationError()
@@ -287,6 +277,9 @@ final class AListProcessController {
             }
             if await isServiceReachable(at: serviceURL) {
                 return
+            }
+            if Date() >= deadline {
+                throw DesktopHostError.startupTimedOut(Self.startupTimeout)
             }
             try await Task.sleep(for: .milliseconds(250))
         }
@@ -307,13 +300,25 @@ final class AListProcessController {
     private func terminateOrphanedManagedProcessIfNeeded() throws {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: pidFileURL.path) else { return }
-        let rawPid = try String(contentsOf: pidFileURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let pid = pid_t(rawPid) else {
+        guard let data = try? Data(contentsOf: pidFileURL),
+              let record = try? JSONDecoder().decode(ManagedProcessRecord.self, from: data)
+        else {
+            appendHostLog("Discarding a legacy or invalid managed-process record")
             removePidFile()
             return
         }
 
+        let pid = pid_t(record.pid)
+
         if kill(pid, 0) != 0 {
+            removePidFile()
+            return
+        }
+
+        guard let executablePath = executablePath(for: pid),
+              normalizedPath(executablePath) == normalizedPath(record.executablePath)
+        else {
+            appendHostLog("Discarding stale process record for pid \(pid); executable did not match")
             removePidFile()
             return
         }
@@ -333,19 +338,35 @@ final class AListProcessController {
         removePidFile()
     }
 
-    private func mergedEnvironment() -> [String: String] {
+    private func mergedEnvironment(port: Int) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = NSHomeDirectory()
         environment["TMPDIR"] = dataDirectory.appendingPathComponent("temp", isDirectory: true).path
         environment["ALIST_DESKTOP_MODE"] = "1"
+        environment["ALIST_SCHEME_ADDR"] = bindingHost
+        environment["ALIST_SCHEME_HTTP_PORT"] = String(port)
+        environment["ALIST_SCHEME_HTTPS_PORT"] = "-1"
+        environment.removeValue(forKey: "ALIST_SITE_URL")
+        if !allowsLANAccess {
+            environment["ALIST_SITE_URL"] = "http://127.0.0.1:\(port)"
+        }
+
+        if !FileManager.default.fileExists(atPath: dataDirectory.appendingPathComponent("data.db").path),
+           environment["ALIST_ADMIN_PASSWORD"]?.isEmpty != false {
+            let password = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            environment["ALIST_ADMIN_PASSWORD"] = password
+            initialAdminPassword = password
+        }
         return environment
     }
 
     private func openLogHandle(at url: URL) throws -> FileHandle {
         let fileManager = FileManager.default
+        try rotateLogIfNeeded(at: url)
         if !fileManager.fileExists(atPath: url.path) {
             fileManager.createFile(atPath: url.path, contents: nil)
         }
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         let handle = try FileHandle(forWritingTo: url)
         try handle.seekToEnd()
         return handle
@@ -357,9 +378,11 @@ final class AListProcessController {
         let data = Data(line.utf8)
 
         let fileManager = FileManager.default
+        try? rotateLogIfNeeded(at: hostLogURL)
         if !fileManager.fileExists(atPath: hostLogURL.path) {
             fileManager.createFile(atPath: hostLogURL.path, contents: nil)
         }
+        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: hostLogURL.path)
 
         if let handle = try? FileHandle(forWritingTo: hostLogURL) {
             _ = try? handle.seekToEnd()
@@ -371,11 +394,50 @@ final class AListProcessController {
     private func removePidFile() {
         try? FileManager.default.removeItem(at: pidFileURL)
     }
-}
 
-private extension pid_t {
-    init?(_ string: String) {
-        guard let value = Int(string) else { return nil }
-        self = pid_t(value)
+    private func writeManagedProcessRecord(pid: pid_t, executableURL: URL) throws {
+        let record = ManagedProcessRecord(
+            pid: Int32(pid),
+            executablePath: normalizedPath(executableURL.path)
+        )
+        let data = try JSONEncoder().encode(record)
+        try data.write(to: pidFileURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pidFileURL.path)
+    }
+
+    private func executablePath(for pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: Self.processPathBufferSize)
+        let result = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard result > 0 else { return nil }
+        return String(
+            decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
+    }
+
+    private func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private func rotateLogIfNeeded(at url: URL) throws {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        guard let size = attributes[.size] as? NSNumber,
+              size.intValue >= Self.maximumDesktopLogSize
+        else {
+            return
+        }
+
+        for index in stride(from: Self.desktopLogBackups, through: 1, by: -1) {
+            let destination = url.appendingPathExtension("\(index)")
+            let source = index == 1 ? url : url.appendingPathExtension("\(index - 1)")
+            guard fileManager.fileExists(atPath: source.path) else { continue }
+            if fileManager.fileExists(atPath: destination.path) {
+                try fileManager.removeItem(at: destination)
+            }
+            try fileManager.moveItem(at: source, to: destination)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+        }
     }
 }

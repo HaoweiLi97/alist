@@ -108,15 +108,39 @@ create_icons
 SIGN_IDENTITY="${ALIST_DESKTOP_CODESIGN_IDENTITY:--}"
 if [[ "$SIGN_IDENTITY" == "-" ]]; then
   codesign --force --sign - "$ALIST_EXECUTABLE"
-  codesign --force --deep --sign - "$APP_BUNDLE"
+  codesign --force --sign - "$APP_BUNDLE"
 else
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$ALIST_EXECUTABLE"
-  codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
 fi
-codesign --verify --deep --strict "$APP_BUNDLE"
+codesign --verify --strict --verbose=2 "$APP_BUNDLE"
 
 ZIP_PATH="$BUILD_DIR/AList-Desktop-macOS-universal-$SAFE_VERSION.zip"
 ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ZIP_PATH"
+
+notarize() {
+  local artifact="$1"
+  if [[ -n "${ALIST_DESKTOP_NOTARY_PROFILE:-}" ]]; then
+    xcrun notarytool submit "$artifact" --keychain-profile "$ALIST_DESKTOP_NOTARY_PROFILE" --wait
+    return
+  fi
+  if [[ -n "${ALIST_DESKTOP_NOTARY_APPLE_ID:-}" && -n "${ALIST_DESKTOP_NOTARY_TEAM_ID:-}" && -n "${ALIST_DESKTOP_NOTARY_PASSWORD:-}" ]]; then
+    xcrun notarytool submit "$artifact" \
+      --apple-id "$ALIST_DESKTOP_NOTARY_APPLE_ID" \
+      --team-id "$ALIST_DESKTOP_NOTARY_TEAM_ID" \
+      --password "$ALIST_DESKTOP_NOTARY_PASSWORD" \
+      --wait
+  fi
+}
+
+NOTARIZATION_ENABLED=false
+if [[ -n "${ALIST_DESKTOP_NOTARY_PROFILE:-}" || ( -n "${ALIST_DESKTOP_NOTARY_APPLE_ID:-}" && -n "${ALIST_DESKTOP_NOTARY_TEAM_ID:-}" && -n "${ALIST_DESKTOP_NOTARY_PASSWORD:-}" ) ]]; then
+  NOTARIZATION_ENABLED=true
+  notarize "$ZIP_PATH"
+  xcrun stapler staple "$APP_BUNDLE"
+  xcrun stapler validate "$APP_BUNDLE"
+  ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ZIP_PATH"
+fi
 
 DMG_STAGE="$WORK_DIR/dmg"
 mkdir -p "$DMG_STAGE"
@@ -125,18 +149,12 @@ ln -s /Applications "$DMG_STAGE/Applications"
 DMG_PATH="$BUILD_DIR/AList-Desktop-macOS-universal-$SAFE_VERSION.dmg"
 hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_PATH" >/dev/null
 
-if [[ -n "${ALIST_DESKTOP_NOTARY_PROFILE:-}" ]]; then
-  xcrun notarytool submit "$DMG_PATH" --keychain-profile "$ALIST_DESKTOP_NOTARY_PROFILE" --wait
-  xcrun stapler staple "$APP_BUNDLE"
+if [[ "$NOTARIZATION_ENABLED" == "true" ]]; then
+  notarize "$DMG_PATH"
   xcrun stapler staple "$DMG_PATH"
-elif [[ -n "${ALIST_DESKTOP_NOTARY_APPLE_ID:-}" && -n "${ALIST_DESKTOP_NOTARY_TEAM_ID:-}" && -n "${ALIST_DESKTOP_NOTARY_PASSWORD:-}" ]]; then
-  xcrun notarytool submit "$DMG_PATH" \
-    --apple-id "$ALIST_DESKTOP_NOTARY_APPLE_ID" \
-    --team-id "$ALIST_DESKTOP_NOTARY_TEAM_ID" \
-    --password "$ALIST_DESKTOP_NOTARY_PASSWORD" \
-    --wait
-  xcrun stapler staple "$APP_BUNDLE"
-  xcrun stapler staple "$DMG_PATH"
+  xcrun stapler validate "$DMG_PATH"
+  spctl --assess --type execute --verbose=4 "$APP_BUNDLE"
+  spctl --assess --type open --verbose=4 "$DMG_PATH"
 fi
 
 echo "Created $ZIP_PATH"

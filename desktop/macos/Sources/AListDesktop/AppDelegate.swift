@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let url = try await startWithPortRecovery()
                 browserWindowController?.loadApp(at: url)
+                presentInitialCredentialsIfNeeded()
             } catch {
                 presentStartupError(error)
             }
@@ -177,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let url = try await startWithPortRecovery()
                 controller.loadApp(at: url)
                 controller.showWindowAndActivate()
+                presentInitialCredentialsIfNeeded()
             } catch {
                 controller.showError(
                     title: "AList failed to start",
@@ -282,10 +284,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         allowLANAccessMenuItem?.state = processController.allowsLANAccess ? .on : .off
     }
 
+    private func presentInitialCredentialsIfNeeded() {
+        guard let password = processController.takeInitialAdminPassword() else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Save your AList admin password"
+        alert.informativeText = "A secure password was created for the initial admin account.\n\nUsername: admin\nPassword: \(password)\n\nStore it in a password manager before continuing."
+        alert.addButton(withTitle: "Copy Password")
+        alert.addButton(withTitle: "Continue")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(password, forType: .string)
+        }
+    }
+
     @objc
     private func toggleAllowLANAccess(_ sender: Any?) {
         let previousValue = processController.allowsLANAccess
         let nextValue = !previousValue
+        if nextValue && !confirmLANAccess() {
+            return
+        }
         processController.allowsLANAccess = nextValue
         updateAllowLANAccessMenuItem()
 
@@ -308,6 +328,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 controller.showWindowAndActivate()
             }
         }
+    }
+
+    private func confirmLANAccess() -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Allow AList access from your local network?"
+        alert.informativeText = "Anyone on your local network can reach this AList instance. Only enable this on a trusted network, keep your admin password private, and review your AList sharing settings."
+        alert.addButton(withTitle: "Enable LAN Access")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     @objc

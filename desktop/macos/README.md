@@ -9,9 +9,10 @@
 - 独立窗口内嵌 `WKWebView`
 - 数据目录固定在 `~/Library/Application Support/AListDesktop`
 - 生成 universal `.app` 与 `.dmg`
-- 首次启动默认管理员账号为 `admin / admin`，可通过环境变量 `ALIST_ADMIN_PASSWORD` 覆盖
+- 首次启动会为管理员账号 `admin` 生成随机密码，并在本机显示一次；可通过环境变量 `ALIST_ADMIN_PASSWORD` 指定密码
 - 应用图标使用 `desktop/windows/Resources/logo.svg`
 - 菜单栏图标使用同一 logo 的 template 版本，macOS 会自动渲染成白色/深色
+- 默认仅监听 `127.0.0.1`；启用 LAN 访问前会显示安全提醒
 
 ## 本地构建
 
