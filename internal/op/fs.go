@@ -246,6 +246,11 @@ func GetUnwrap(ctx context.Context, storage driver.Driver, path string) (model.O
 var linkCache = cache.NewMemCache(cache.WithShards[*model.Link](16))
 var linkG singleflight.Group[*model.Link]
 
+// linkTimeout bounds an external storage's link resolution, including retries.
+// A slow provider must not hold a client request (or the shared link call) open
+// indefinitely.
+var linkTimeout = 20 * time.Second
+
 // Link get link, if is an url. should have an expiry time
 func Link(ctx context.Context, storage driver.Driver, path string, args model.LinkArgs) (*model.Link, model.Obj, error) {
 	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
@@ -262,8 +267,8 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	if link, ok := linkCache.Get(key); ok {
 		return link, file, nil
 	}
-	fn := func() (*model.Link, error) {
-		link, err := storage.Link(ctx, file, args)
+	fn := func(linkCtx context.Context) (*model.Link, error) {
+		link, err := storage.Link(linkCtx, file, args)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed get link")
 		}
@@ -277,12 +282,26 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	}
 
 	if storage.Config().OnlyLocal {
-		link, err := fn()
+		link, err := fn(ctx)
 		return link, file, err
 	}
 
-	link, err, _ := linkG.Do(key, fn)
-	return link, file, err
+	resultCh := linkG.DoChan(key, func() (*model.Link, error) {
+		// The first request that reaches singleflight owns the underlying call.
+		// Do not let its client disconnect cancel work that other callers are
+		// waiting for; the operation is still bounded by linkTimeout.
+		linkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), linkTimeout)
+		defer cancel()
+		return fn(linkCtx)
+	})
+	waitCtx, cancel := context.WithTimeout(ctx, linkTimeout)
+	defer cancel()
+	select {
+	case result := <-resultCh:
+		return result.Val, file, result.Err
+	case <-waitCtx.Done():
+		return nil, file, errors.Wrap(waitCtx.Err(), "get link timeout")
+	}
 }
 
 // Other api

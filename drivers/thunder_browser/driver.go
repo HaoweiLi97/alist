@@ -20,6 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"io"
 	"net/http"
+	"net/url"
 	stdpath "path"
 	"strconv"
 	"strings"
@@ -331,10 +332,11 @@ type cachedObj struct {
 }
 
 const (
-	getObjCacheTTL             = 15 * time.Second
-	staleGetObjCacheTTL        = 5 * time.Minute
-	transientResolveRetryCount = 2
-	transientResolveRetryDelay = 250 * time.Millisecond
+	getObjCacheTTL              = 15 * time.Second
+	staleGetObjCacheTTL         = 5 * time.Minute
+	transientResolveRetryCount  = 2
+	transientResolveRetryDelay  = 250 * time.Millisecond
+	directLinkCacheSafetyMargin = 30 * time.Second
 )
 
 func (xc *XunLeiBrowserCommon) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
@@ -478,16 +480,44 @@ func (xc *XunLeiBrowserCommon) Link(ctx context.Context, file model.Obj, args mo
 			"User-Agent": {xc.DownloadUserAgent},
 		},
 	}
+	var expiresAt time.Time
 
 	if xc.UseVideoUrl {
 		for _, media := range lFile.Medias {
 			if media.Link.URL != "" {
 				link.URL = media.Link.URL
+				expiresAt = media.Link.Expire
 				break
 			}
 		}
 	}
+	if expiration, ok := directLinkExpiration(link.URL, expiresAt, time.Now()); ok {
+		link.Expiration = &expiration
+	}
 	return link, nil
+}
+
+// directLinkExpiration returns a safe cache lifetime for a Xunlei direct link.
+// Download links normally expose their Unix expiry timestamp as the `e` query
+// parameter; video links may instead return an explicit expiry in the payload.
+func directLinkExpiration(rawURL string, expiresAt, now time.Time) (time.Duration, bool) {
+	if expiresAt.IsZero() {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return 0, false
+		}
+		timestamp, err := strconv.ParseInt(u.Query().Get("e"), 10, 64)
+		if err != nil || timestamp <= 0 {
+			return 0, false
+		}
+		expiresAt = time.Unix(timestamp, 0)
+	}
+
+	expiration := expiresAt.Sub(now) - directLinkCacheSafetyMargin
+	if expiration <= 0 {
+		return 0, false
+	}
+	return expiration, true
 }
 
 func (xc *XunLeiBrowserCommon) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {

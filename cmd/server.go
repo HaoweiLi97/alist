@@ -42,6 +42,9 @@ the address is defined in config file`,
 			gin.SetMode(gin.ReleaseMode)
 		}
 		r := gin.New()
+		// Driver requests receive *gin.Context. Enable its context fallback so
+		// upstream requests are cancelled when the original HTTP client goes away.
+		r.ContextWithFallback = true
 		r.Use(gin.LoggerWithWriter(log.StandardLogger().Out), gin.RecoveryWithWriter(log.StandardLogger().Out))
 		server.Init(r)
 		var httpSrv, httpsSrv, unixSrv *http.Server
@@ -93,6 +96,7 @@ the address is defined in config file`,
 		}
 		if conf.Conf.S3.Port != -1 && conf.Conf.S3.Enable {
 			s3r := gin.New()
+			s3r.ContextWithFallback = true
 			s3r.Use(gin.LoggerWithWriter(log.StandardLogger().Out), gin.RecoveryWithWriter(log.StandardLogger().Out))
 			server.InitS3(s3r)
 			s3Base := fmt.Sprintf("%s:%d", conf.Conf.Scheme.Address, conf.Conf.S3.Port)
