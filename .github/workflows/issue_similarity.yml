@@ -1,8 +1,7 @@
 name: Issues Similarity Analysis
 
 on:
-  issues:
-    types: [opened, edited]
+  workflow_dispatch:
 
 jobs:
   similarity-analysis:

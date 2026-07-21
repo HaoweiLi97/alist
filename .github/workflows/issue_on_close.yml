@@ -1,8 +1,7 @@
 name: Remove working label when issue closed
 
 on:
-  issues:
-    types: [closed]
+  workflow_dispatch:
 
 jobs:
   rm-working:

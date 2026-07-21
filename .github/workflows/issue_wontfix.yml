@@ -1,8 +1,7 @@
 name: Issue Wontfix
 
 on:
-  issues:
-    types: [labeled]
+  workflow_dispatch:
 
 jobs:
   lock-issue:
