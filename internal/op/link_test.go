@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,5 +73,81 @@ func TestLinkAppliesTotalTimeoutToSharedCallAndWaiters(t *testing.T) {
 
 	if err := <-firstDone; !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("shared Link() error = %v, want context deadline exceeded", err)
+	}
+}
+
+type parallelLinkDriver struct {
+	model.Storage
+	root    driver.RootID
+	file    model.Obj
+	started chan struct{}
+	release chan struct{}
+	active  atomic.Int32
+	max     atomic.Int32
+}
+
+func newParallelLinkDriver(mountPath string) *parallelLinkDriver {
+	return &parallelLinkDriver{
+		Storage: model.Storage{MountPath: mountPath},
+		file:    &model.Object{ID: "file", Path: "/file", Name: "file"},
+		started: make(chan struct{}, maxConcurrentLinkResolutions),
+		release: make(chan struct{}),
+	}
+}
+
+func (d *parallelLinkDriver) Config() driver.Config {
+	return driver.Config{Name: "parallel-link", NoCache: true}
+}
+func (d *parallelLinkDriver) GetAddition() driver.Additional {
+	return &d.root
+}
+func (d *parallelLinkDriver) Init(context.Context) error { return nil }
+func (d *parallelLinkDriver) Drop(context.Context) error { return nil }
+func (d *parallelLinkDriver) Get(context.Context, string) (model.Obj, error) {
+	return d.file, nil
+}
+func (d *parallelLinkDriver) List(context.Context, model.Obj, model.ListArgs) ([]model.Obj, error) {
+	return nil, nil
+}
+func (d *parallelLinkDriver) Link(context.Context, model.Obj, model.LinkArgs) (*model.Link, error) {
+	active := d.active.Add(1)
+	defer d.active.Add(-1)
+	for {
+		maximum := d.max.Load()
+		if active <= maximum || d.max.CompareAndSwap(maximum, active) {
+			break
+		}
+	}
+	d.started <- struct{}{}
+	<-d.release
+	return &model.Link{URL: "https://example.com/file"}, nil
+}
+
+func TestLinkLimitsParallelResolutionsPerPath(t *testing.T) {
+	d := newParallelLinkDriver("/parallel-link-test")
+	errs := make(chan error, maxConcurrentLinkResolutions+2)
+	for range cap(errs) {
+		go func() {
+			_, _, err := Link(context.Background(), d, "/file", model.LinkArgs{})
+			errs <- err
+		}()
+	}
+
+	for range maxConcurrentLinkResolutions {
+		select {
+		case <-d.started:
+		case <-time.After(time.Second):
+			t.Fatal("did not start the allowed number of parallel resolutions")
+		}
+	}
+	if got := d.max.Load(); got != maxConcurrentLinkResolutions {
+		t.Fatalf("maximum parallel resolutions = %d, want %d", got, maxConcurrentLinkResolutions)
+	}
+
+	close(d.release)
+	for range cap(errs) {
+		if err := <-errs; err != nil {
+			t.Fatalf("Link() error = %v, want nil", err)
+		}
 	}
 }

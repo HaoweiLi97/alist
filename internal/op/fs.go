@@ -3,6 +3,7 @@ package op
 import (
 	"context"
 	stdpath "path"
+	"sync"
 	"time"
 
 	"github.com/Xhofe/go-cache"
@@ -244,12 +245,93 @@ func GetUnwrap(ctx context.Context, storage driver.Driver, path string) (model.O
 }
 
 var linkCache = cache.NewMemCache(cache.WithShards[*model.Link](16))
-var linkG singleflight.Group[*model.Link]
 
 // linkTimeout bounds an external storage's link resolution, including retries.
 // A slow provider must not hold a client request (or the shared link call) open
 // indefinitely.
 var linkTimeout = 20 * time.Second
+
+const maxConcurrentLinkResolutions = 5
+
+type linkResolutionResult struct {
+	link *model.Link
+	err  error
+}
+
+type linkResolution struct {
+	mu        sync.Mutex
+	done      chan struct{}
+	result    linkResolutionResult
+	active    int
+	completed bool
+	cancels   []context.CancelFunc
+}
+
+var linkResolutions = struct {
+	sync.Mutex
+	m map[string]*linkResolution
+}{m: make(map[string]*linkResolution)}
+
+func getLinkResolution(key string) *linkResolution {
+	linkResolutions.Lock()
+	defer linkResolutions.Unlock()
+	if resolution, ok := linkResolutions.m[key]; ok {
+		return resolution
+	}
+	resolution := &linkResolution{done: make(chan struct{})}
+	linkResolutions.m[key] = resolution
+	return resolution
+}
+
+func (r *linkResolution) start(ctx context.Context, key string, fn func(context.Context) (*model.Link, error)) {
+	r.mu.Lock()
+	if r.completed || r.active >= maxConcurrentLinkResolutions {
+		r.mu.Unlock()
+		return
+	}
+	r.active++
+	linkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), linkTimeout)
+	r.cancels = append(r.cancels, cancel)
+	r.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		link, err := fn(linkCtx)
+		r.finish(key, link, err)
+	}()
+}
+
+func (r *linkResolution) finish(key string, link *model.Link, err error) {
+	r.mu.Lock()
+	if r.completed {
+		r.mu.Unlock()
+		return
+	}
+	r.active--
+	if err == nil {
+		r.result = linkResolutionResult{link: link}
+		r.completed = true
+	} else if r.active == 0 {
+		r.result = linkResolutionResult{err: err}
+		r.completed = true
+	}
+	if !r.completed {
+		r.mu.Unlock()
+		return
+	}
+	cancels := append([]context.CancelFunc(nil), r.cancels...)
+	close(r.done)
+	r.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	linkResolutions.Lock()
+	if linkResolutions.m[key] == r {
+		delete(linkResolutions.m, key)
+	}
+	linkResolutions.Unlock()
+}
 
 // Link get link, if is an url. should have an expiry time
 func Link(ctx context.Context, storage driver.Driver, path string, args model.LinkArgs) (*model.Link, model.Obj, error) {
@@ -286,19 +368,16 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 		return link, file, err
 	}
 
-	resultCh := linkG.DoChan(key, func() (*model.Link, error) {
-		// The first request that reaches singleflight owns the underlying call.
-		// Do not let its client disconnect cancel work that other callers are
-		// waiting for; the operation is still bounded by linkTimeout.
-		linkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), linkTimeout)
-		defer cancel()
-		return fn(linkCtx)
-	})
+	resolution := getLinkResolution(key)
+	// Allow a small number of hedged requests for a slow upstream provider.
+	// Further callers share the first successful result instead of creating an
+	// unbounded retry storm.
+	resolution.start(ctx, key, fn)
 	waitCtx, cancel := context.WithTimeout(ctx, linkTimeout)
 	defer cancel()
 	select {
-	case result := <-resultCh:
-		return result.Val, file, result.Err
+	case <-resolution.done:
+		return resolution.result.link, file, resolution.result.err
 	case <-waitCtx.Done():
 		return nil, file, errors.Wrap(waitCtx.Err(), "get link timeout")
 	}
