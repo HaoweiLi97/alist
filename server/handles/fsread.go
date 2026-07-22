@@ -303,7 +303,7 @@ func FsGet(c *gin.Context) {
 				rawURL = url
 			} else {
 				// if storage is not proxy, use raw url by fs.Link
-				link, _, err := fs.Link(c, reqPath, model.LinkArgs{
+				link, err := fs.LinkWithObj(c, reqPath, obj, model.LinkArgs{
 					IP:      c.ClientIP(),
 					Header:  c.Request.Header,
 					HttpReq: c.Request,

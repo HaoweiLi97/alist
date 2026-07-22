@@ -251,7 +251,7 @@ var linkCache = cache.NewMemCache(cache.WithShards[*model.Link](16))
 // indefinitely.
 var linkTimeout = 20 * time.Second
 
-const maxConcurrentLinkResolutions = 5
+const maxConcurrentLinkResolutions = 3
 
 type linkResolutionResult struct {
 	link *model.Link
@@ -342,12 +342,26 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	if err != nil {
 		return nil, nil, errors.WithMessage(err, "failed to get file")
 	}
+	link, err := LinkWithObj(ctx, storage, path, file, args)
+	return link, file, err
+}
+
+// LinkWithObj resolves a direct link for a file that was already obtained by
+// the caller. This avoids resolving the same path twice for read endpoints.
+func LinkWithObj(ctx context.Context, storage driver.Driver, path string, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
+		return nil, errors.Errorf("storage not init: %s", storage.GetStorage().Status)
+	}
+	file = model.UnwrapObj(file)
+	if file == nil {
+		return nil, errors.New("file is nil")
+	}
 	if file.IsDir() {
-		return nil, nil, errors.WithStack(errs.NotFile)
+		return nil, errors.WithStack(errs.NotFile)
 	}
 	key := Key(storage, path)
 	if link, ok := linkCache.Get(key); ok {
-		return link, file, nil
+		return link, nil
 	}
 	fn := func(linkCtx context.Context) (*model.Link, error) {
 		link, err := storage.Link(linkCtx, file, args)
@@ -365,7 +379,7 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 
 	if storage.Config().OnlyLocal {
 		link, err := fn(ctx)
-		return link, file, err
+		return link, err
 	}
 
 	resolution := getLinkResolution(key)
@@ -377,9 +391,9 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	defer cancel()
 	select {
 	case <-resolution.done:
-		return resolution.result.link, file, resolution.result.err
+		return resolution.result.link, resolution.result.err
 	case <-waitCtx.Done():
-		return nil, file, errors.Wrap(waitCtx.Err(), "get link timeout")
+		return nil, errors.Wrap(waitCtx.Err(), "get link timeout")
 	}
 }
 

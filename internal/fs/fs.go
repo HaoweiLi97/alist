@@ -57,6 +57,15 @@ func Link(ctx context.Context, path string, args model.LinkArgs) (*model.Link, m
 	return res, file, nil
 }
 
+func LinkWithObj(ctx context.Context, path string, obj model.Obj, args model.LinkArgs) (*model.Link, error) {
+	res, err := linkWithObj(ctx, path, obj, args)
+	if err != nil {
+		log.Errorf("failed link %s: %+v", path, err)
+		return nil, err
+	}
+	return res, nil
+}
+
 func MakeDir(ctx context.Context, path string, lazyCache ...bool) error {
 	err := makeDir(ctx, path, lazyCache...)
 	if err != nil {

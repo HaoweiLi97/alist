@@ -27,3 +27,22 @@ func link(ctx context.Context, path string, args model.LinkArgs) (*model.Link, m
 	}
 	return l, obj, nil
 }
+
+// LinkWithObj resolves a direct link without resolving path again. The object
+// must correspond to path and normally comes from Get in the same request.
+func linkWithObj(ctx context.Context, path string, obj model.Obj, args model.LinkArgs) (*model.Link, error) {
+	storage, actualPath, err := op.GetStorageAndActualPath(path)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed get storage")
+	}
+	l, err := op.LinkWithObj(ctx, storage, actualPath, obj, args)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed link")
+	}
+	if l.URL != "" && !strings.HasPrefix(l.URL, "http://") && !strings.HasPrefix(l.URL, "https://") {
+		if c, ok := ctx.(*gin.Context); ok {
+			l.URL = common.GetApiUrl(c.Request) + l.URL
+		}
+	}
+	return l, nil
+}

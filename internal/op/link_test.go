@@ -20,6 +20,49 @@ type slowLinkDriver struct {
 	once    sync.Once
 }
 
+type objectLinkDriver struct {
+	model.Storage
+	root  driver.RootID
+	gets  atomic.Int32
+	links atomic.Int32
+}
+
+func (d *objectLinkDriver) Config() driver.Config {
+	return driver.Config{Name: "object-link", OnlyLocal: true}
+}
+func (d *objectLinkDriver) GetAddition() driver.Additional { return &d.root }
+func (d *objectLinkDriver) Init(context.Context) error     { return nil }
+func (d *objectLinkDriver) Drop(context.Context) error     { return nil }
+func (d *objectLinkDriver) Get(context.Context, string) (model.Obj, error) {
+	d.gets.Add(1)
+	return &model.Object{ID: "file", Name: "file"}, nil
+}
+func (d *objectLinkDriver) List(context.Context, model.Obj, model.ListArgs) ([]model.Obj, error) {
+	return nil, nil
+}
+func (d *objectLinkDriver) Link(context.Context, model.Obj, model.LinkArgs) (*model.Link, error) {
+	d.links.Add(1)
+	return &model.Link{URL: "https://example.com/file"}, nil
+}
+
+func TestLinkWithObjSkipsObjectLookup(t *testing.T) {
+	d := &objectLinkDriver{Storage: model.Storage{MountPath: "/object-link-test"}}
+	file := &model.Object{ID: "file", Name: "file"}
+	link, err := LinkWithObj(context.Background(), d, "/file", file, model.LinkArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if link.URL == "" {
+		t.Fatal("LinkWithObj returned an empty URL")
+	}
+	if got := d.gets.Load(); got != 0 {
+		t.Fatalf("Get calls = %d, want 0", got)
+	}
+	if got := d.links.Load(); got != 1 {
+		t.Fatalf("Link calls = %d, want 1", got)
+	}
+}
+
 func newSlowLinkDriver(mountPath string) *slowLinkDriver {
 	return &slowLinkDriver{
 		Storage: model.Storage{MountPath: mountPath},

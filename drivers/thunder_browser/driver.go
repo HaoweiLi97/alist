@@ -317,6 +317,8 @@ type XunLeiBrowserCommon struct {
 	pathRefCache     sync.Map // cleaned full path -> pathRef
 	getObjCache      sync.Map // cleaned full path -> cachedObj
 	getObjG          singleflight.Group[model.Obj]
+	dirFilesCache    sync.Map // space:id -> cachedDirFiles
+	dirFilesG        singleflight.Group[[]model.Obj]
 }
 
 type pathRef struct {
@@ -331,16 +333,22 @@ type cachedObj struct {
 	staleExpiresAt int64
 }
 
+type cachedDirFiles struct {
+	files     []model.Obj
+	expiresAt int64
+}
+
 const (
 	getObjCacheTTL              = 15 * time.Second
 	staleGetObjCacheTTL         = 5 * time.Minute
+	dirFilesCacheTTL            = 2 * time.Second
 	transientResolveRetryCount  = 2
 	transientResolveRetryDelay  = 250 * time.Millisecond
 	directLinkCacheSafetyMargin = 30 * time.Second
 )
 
 func (xc *XunLeiBrowserCommon) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	files, err := xc.getFiles(ctx, dir, args.ReqPath)
+	files, err := xc.getFiles(ctx, dir, args.Refresh)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +364,9 @@ func (xc *XunLeiBrowserCommon) List(ctx context.Context, dir model.Obj, args mod
 			if f, ok := obj.(*Files); ok {
 				ref.Space = f.GetSpace()
 			}
-			xc.cachePathRef(stdpath.Join(reqPath, obj.GetName()), ref)
+			childPath := stdpath.Join(reqPath, obj.GetName())
+			xc.cachePathRef(childPath, ref)
+			xc.storeCachedObj(childPath, obj)
 		}
 	}
 	return files, nil
@@ -371,6 +381,9 @@ func (xc *XunLeiBrowserCommon) Get(ctx context.Context, path string) (model.Obj,
 			Modified: time.Time{},
 			IsFolder: true,
 		}, nil
+	}
+	if hasRepeatedThunderRoot(cleanPath) {
+		return nil, errs.ObjectNotFound
 	}
 
 	if cached, ok := xc.loadCachedObj(cleanPath); ok {
@@ -402,10 +415,31 @@ func (xc *XunLeiBrowserCommon) Get(ctx context.Context, path string) (model.Obj,
 	return obj, err
 }
 
+// hasRepeatedThunderRoot prevents Xunlei's virtual root entry from being
+// interpreted as a child of itself. Such a path is never a real cloud path and
+// can otherwise be revived by the stale-object fallback.
+func hasRepeatedThunderRoot(cleanPath string) bool {
+	parts := strings.Split(strings.Trim(utils.FixAndCleanPath(cleanPath), "/"), "/")
+	for i := 1; i < len(parts); i++ {
+		if parts[i-1] == "迅雷云盘" && parts[i] == "迅雷云盘" {
+			return true
+		}
+	}
+	return false
+}
+
 func (xc *XunLeiBrowserCommon) getNoSingleflight(ctx context.Context, cleanPath string) (model.Obj, error) {
 
 	if ref, ok := xc.loadPathRef(cleanPath); ok && ref.ID != "" {
 		log.Debugf("[thunder_browser.get] cache-hit path=%s id=%s space=%s", cleanPath, ref.ID, ref.Space)
+		if obj, ok := xc.loadStaleCachedObj(cleanPath); ok && xc.pathObjLooksValid(cleanPath, obj, ref) {
+			// A preceding directory listing already supplied this object's ID and
+			// metadata. Xunlei's by-ID response is occasionally empty for valid
+			// objects; reusing the short-lived stale entry prevents a costly full
+			// parent-directory scan in that case. A refreshed listing overwrites it.
+			log.Debugf("[thunder_browser.get] stale-cache-hit path=%s", cleanPath)
+			return obj, nil
+		}
 		if obj, err := xc.getByID(ctx, ref.ID, ref.Space); err == nil {
 			if xc.pathObjLooksValid(cleanPath, obj, ref) {
 				log.Debugf("[thunder_browser.get] by-id success path=%s", cleanPath)
@@ -431,7 +465,7 @@ func (xc *XunLeiBrowserCommon) getNoSingleflight(ctx context.Context, cleanPath 
 		Kind:  FOLDER,
 	}
 	for attempt := 0; attempt <= transientResolveRetryCount; attempt++ {
-		children, err := xc.getFiles(ctx, parentDir, parentPath)
+		children, err := xc.getFiles(ctx, parentDir, false)
 		if err != nil {
 			return nil, err
 		}
@@ -758,9 +792,66 @@ func (xc *XunLeiBrowserCommon) DeleteOfflineTasks(ctx context.Context, taskIDs [
 	return nil
 }
 
-func (xc *XunLeiBrowserCommon) getFiles(ctx context.Context, dir model.Obj, path string) ([]model.Obj, error) {
+func (xc *XunLeiBrowserCommon) directoryFilesKey(dir model.Obj) string {
+	if files, ok := dir.(*Files); ok {
+		// The virtual driver root and the real “迅雷云盘” root both have an
+		// empty ID, but live in different spaces. Keep their cache entries apart.
+		return "files:" + files.GetSpace() + ":" + files.GetID()
+	}
+	return "root:" + ThunderBrowserDriveSpace + ":" + dir.GetID()
+}
+
+func cloneObjs(objs []model.Obj) []model.Obj {
+	return append([]model.Obj(nil), objs...)
+}
+
+func (xc *XunLeiBrowserCommon) loadCachedDirFiles(key string) ([]model.Obj, bool) {
+	v, ok := xc.dirFilesCache.Load(key)
+	if !ok {
+		return nil, false
+	}
+	entry, ok := v.(cachedDirFiles)
+	if !ok || time.Now().UnixNano() > entry.expiresAt {
+		xc.dirFilesCache.Delete(key)
+		return nil, false
+	}
+	return cloneObjs(entry.files), true
+}
+
+func (xc *XunLeiBrowserCommon) getFiles(ctx context.Context, dir model.Obj, refresh bool) ([]model.Obj, error) {
+	key := xc.directoryFilesKey(dir)
+	if !refresh {
+		if files, ok := xc.loadCachedDirFiles(key); ok {
+			return files, nil
+		}
+	}
+
+	files, err, _ := xc.dirFilesG.Do(key, func() ([]model.Obj, error) {
+		if !refresh {
+			if files, ok := xc.loadCachedDirFiles(key); ok {
+				return files, nil
+			}
+		}
+		files, err := xc.getFilesUncached(ctx, dir)
+		if err != nil {
+			return nil, err
+		}
+		xc.dirFilesCache.Store(key, cachedDirFiles{
+			files:     cloneObjs(files),
+			expiresAt: time.Now().Add(dirFilesCacheTTL).UnixNano(),
+		})
+		return files, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cloneObjs(files), nil
+}
+
+func (xc *XunLeiBrowserCommon) getFilesUncached(ctx context.Context, dir model.Obj) ([]model.Obj, error) {
 	files := make([]model.Obj, 0)
 	var pageToken string
+	_, isNestedDirectory := dir.(*Files)
 	for {
 		var fileList FileList
 		folderSpace := ""
@@ -788,13 +879,17 @@ func (xc *XunLeiBrowserCommon) getFiles(ctx context.Context, dir model.Obj, path
 		if err != nil {
 			return nil, err
 		}
-
 		for i := range fileList.Files {
-			// 解决 "迅雷云盘" 重复出现问题————迅雷后端发送错误
-			if fileList.Files[i].FolderType == ThunderDriveFolderType && fileList.Files[i].ID == "" && fileList.Files[i].Space == "" && dir.GetID() != "" {
+			file := &fileList.Files[i]
+			isDefaultThunderRoot := file.Name == "迅雷云盘" && file.FolderType == ThunderDriveFolderType && file.ID == "" && file.Space == ""
+			// Xunlei returns two “迅雷云盘” entries at the virtual root. Keep
+			// only the empty-ID DEFAULT_ROOT entry; the NORMAL one points to an
+			// invalid duplicate path. Inside a directory, ignore any echoed
+			// DEFAULT_ROOT entry as well.
+			if (!isNestedDirectory && file.Name == "迅雷云盘" && !isDefaultThunderRoot) || (isNestedDirectory && file.Name == "迅雷云盘") {
 				continue
 			}
-			files = append(files, &fileList.Files[i])
+			files = append(files, file)
 		}
 
 		if fileList.NextPageToken == "" {
@@ -811,7 +906,6 @@ func (xc *XunLeiBrowserCommon) getByID(ctx context.Context, fileID, space string
 		"_magic":         "2021",
 		"space":          space,
 		"thumbnail_size": "SIZE_LARGE",
-		"with":           "url",
 	}
 	_, err := xc.Request(FILE_API_URL+"/{fileID}", http.MethodGet, func(r *resty.Request) {
 		r.SetContext(ctx)
@@ -942,7 +1036,7 @@ func (xc *XunLeiBrowserCommon) resolveDirRefByPath(ctx context.Context, dirPath 
 		dirObj := &Files{ID: curRef.ID, Space: curRef.Space, Kind: FOLDER}
 		found := false
 		for attempt := 0; attempt <= transientResolveRetryCount; attempt++ {
-			items, err := xc.getFiles(ctx, dirObj, curPath)
+			items, err := xc.getFiles(ctx, dirObj, false)
 			if err != nil {
 				return pathRef{}, err
 			}
