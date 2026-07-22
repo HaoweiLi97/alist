@@ -22,6 +22,9 @@ type TaskInfo struct {
 	Status      string      `json:"status"`
 	Progress    float64     `json:"progress"`
 	Error       string      `json:"error"`
+	URL         string      `json:"url,omitempty"`
+	DstDirPath  string      `json:"dst_dir_path,omitempty"`
+	Tool        string      `json:"tool,omitempty"`
 }
 
 func getTaskInfo[T task.TaskInfoWithCreator](task T) TaskInfo {
@@ -40,7 +43,7 @@ func getTaskInfo[T task.TaskInfoWithCreator](task T) TaskInfo {
 		creatorName = task.GetCreator().Username
 		creatorRole = task.GetCreator().Role
 	}
-	return TaskInfo{
+	info := TaskInfo{
 		ID:          task.GetID(),
 		Name:        task.GetName(),
 		Creator:     creatorName,
@@ -50,6 +53,12 @@ func getTaskInfo[T task.TaskInfoWithCreator](task T) TaskInfo {
 		Progress:    progress,
 		Error:       errMsg,
 	}
+	if downloadTask, ok := any(task).(*tool.DownloadTask); ok {
+		info.URL = downloadTask.Url
+		info.DstDirPath = downloadTask.DstDirPath
+		info.Tool = downloadTask.Toolname
+	}
+	return info
 }
 
 func getTaskInfos[T task.TaskInfoWithCreator](tasks []T) []TaskInfo {
