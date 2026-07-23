@@ -126,6 +126,9 @@ func (x *ThunderBrowser) Init(ctx context.Context) (err error) {
 }
 
 func (x *ThunderBrowser) Drop(ctx context.Context) error {
+	if x.XunLeiBrowserCommon != nil && x.XunLeiBrowserCommon.Common != nil {
+		x.XunLeiBrowserCommon.Common.Close()
+	}
 	return nil
 }
 
@@ -299,6 +302,9 @@ func (x *ThunderBrowserExpert) Init(ctx context.Context) (err error) {
 }
 
 func (x *ThunderBrowserExpert) Drop(ctx context.Context) error {
+	if x.XunLeiBrowserCommon != nil && x.XunLeiBrowserCommon.Common != nil {
+		x.XunLeiBrowserCommon.Common.Close()
+	}
 	return nil
 }
 

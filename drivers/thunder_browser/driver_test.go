@@ -2,6 +2,7 @@ package thunder_browser
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -240,5 +241,116 @@ func TestGetUsesStaleListedObjectBeforeByID(t *testing.T) {
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("upstream requests = %d, want 0", got)
+	}
+}
+
+func TestCommonRequestResetsClientAfterTransportTimeout(t *testing.T) {
+	originalClient := resty.New().SetTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}))
+	common := &Common{
+		client:        originalClient,
+		clientFactory: resty.New,
+	}
+	t.Cleanup(common.Close)
+
+	if _, err := common.Request("https://example.invalid", http.MethodGet, nil, nil); err == nil {
+		t.Fatal("Request() error = nil, want transport timeout")
+	}
+	currentClient, generation, _, err := common.requestState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentClient == originalClient {
+		t.Fatal("transport timeout did not replace the HTTP client")
+	}
+	if generation != 1 {
+		t.Fatalf("client generation = %d, want 1", generation)
+	}
+}
+
+func TestCommonRequestDoesNotResetClientForCallerCancellation(t *testing.T) {
+	originalClient := resty.New().SetTransport(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, req.Context().Err()
+	}))
+	common := &Common{
+		client:        originalClient,
+		clientFactory: resty.New,
+	}
+	t.Cleanup(common.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := common.Request("https://example.invalid", http.MethodGet, func(req *resty.Request) {
+		req.SetContext(ctx)
+	}, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Request() error = %v, want context canceled", err)
+	}
+	currentClient, generation, _, err := common.requestState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentClient != originalClient {
+		t.Fatal("caller cancellation unexpectedly replaced the HTTP client")
+	}
+	if generation != 0 {
+		t.Fatalf("client generation = %d, want 0", generation)
+	}
+}
+
+func TestCommonCloseCancelsActiveRequest(t *testing.T) {
+	started := make(chan struct{})
+	client := resty.New().SetTransport(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		close(started)
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}))
+	common := &Common{client: client}
+	result := make(chan error, 1)
+	go func() {
+		_, err := common.Request("https://example.invalid", http.MethodGet, nil, nil)
+		result <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request did not start")
+	}
+	common.Close()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Request() error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close() did not cancel the active request")
+	}
+	if _, err := common.Request("https://example.invalid", http.MethodGet, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Request() after Close() error = %v, want context canceled", err)
+	}
+}
+
+func TestResetClientOnlyOncePerGeneration(t *testing.T) {
+	common := &Common{client: resty.New(), clientFactory: resty.New}
+	t.Cleanup(common.Close)
+	const workers = 16
+	start := make(chan struct{})
+	results := make(chan bool, workers)
+	for range workers {
+		go func() {
+			<-start
+			results <- common.resetClientIfCurrent(0)
+		}()
+	}
+	close(start)
+	resets := 0
+	for range workers {
+		if <-results {
+			resets++
+		}
+	}
+	if resets != 1 {
+		t.Fatalf("client resets = %d, want 1", resets)
 	}
 }

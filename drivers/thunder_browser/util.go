@@ -1,19 +1,25 @@
 package thunder_browser
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -72,7 +78,13 @@ func GetAction(method string, url string) string {
 }
 
 type Common struct {
-	client *resty.Client
+	clientMu         sync.Mutex
+	client           *resty.Client
+	clientFactory    func() *resty.Client
+	clientGeneration uint64
+	lifecycleCtx     context.Context
+	lifecycleCancel  context.CancelFunc
+	closed           bool
 
 	captchaToken string
 
@@ -93,6 +105,104 @@ type Common struct {
 
 	// 验证码token刷新成功回调
 	refreshCTokenCk func(token string)
+}
+
+const thunderBrowserRequestTimeout = 20 * time.Second
+
+func (c *Common) newClient() *resty.Client {
+	if c.clientFactory != nil {
+		return c.clientFactory()
+	}
+	return base.NewRestyClient()
+}
+
+func (c *Common) requestState() (*resty.Client, uint64, context.Context, error) {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+	if c.closed {
+		return nil, 0, nil, context.Canceled
+	}
+	if c.client == nil {
+		c.client = c.newClient()
+		c.clientGeneration++
+	}
+	if c.lifecycleCtx == nil {
+		c.lifecycleCtx, c.lifecycleCancel = context.WithCancel(context.Background())
+	}
+	return c.client, c.clientGeneration, c.lifecycleCtx, nil
+}
+
+// resetClientIfCurrent replaces an unhealthy HTTP transport once. Concurrent
+// requests that failed on the same generation observe the replacement and do
+// not create a client-reset storm.
+func (c *Common) resetClientIfCurrent(generation uint64) bool {
+	var oldClient *resty.Client
+	var newGeneration uint64
+	replaced := false
+	func() {
+		c.clientMu.Lock()
+		defer c.clientMu.Unlock()
+		if c.closed || c.clientGeneration != generation {
+			return
+		}
+		oldClient = c.client
+		c.client = c.newClient()
+		c.clientGeneration++
+		newGeneration = c.clientGeneration
+		replaced = true
+	}()
+	if !replaced {
+		return false
+	}
+
+	closeIdleConnections(oldClient)
+	log.Warnf("[thunder_browser] reset HTTP client after transport failure; generation=%d", newGeneration)
+	return true
+}
+
+func closeIdleConnections(client *resty.Client) {
+	if client == nil {
+		return
+	}
+	transport, err := client.Transport()
+	if err == nil {
+		transport.CloseIdleConnections()
+	}
+}
+
+// Close retires this driver instance. The lifecycle cancellation interrupts
+// active HTTP requests even though callers may have supplied their own context.
+func (c *Common) Close() {
+	c.clientMu.Lock()
+	if c.closed {
+		c.clientMu.Unlock()
+		return
+	}
+	c.closed = true
+	cancel := c.lifecycleCancel
+	client := c.client
+	c.clientMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	closeIdleConnections(client)
+}
+
+func isTransientTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
 }
 
 func (c *Common) SetDeviceID(deviceID string) {
@@ -185,7 +295,11 @@ func (c *Common) refreshCaptchaToken(action string, metas map[string]string) err
 
 // Request 只有基础信息的请求
 func (c *Common) Request(url, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	req := c.client.R().SetHeaders(map[string]string{
+	client, generation, lifecycleCtx, err := c.requestState()
+	if err != nil {
+		return nil, err
+	}
+	req := client.R().SetHeaders(map[string]string{
 		"user-agent":       c.UserAgent,
 		"accept":           "application/json;charset=UTF-8",
 		"x-device-id":      c.DeviceID,
@@ -196,11 +310,21 @@ func (c *Common) Request(url, method string, callback base.ReqCallback, resp int
 	if callback != nil {
 		callback(req)
 	}
+	requestCtx, cancel := context.WithTimeout(req.Context(), thunderBrowserRequestTimeout)
+	stopLifecycleCancel := context.AfterFunc(lifecycleCtx, cancel)
+	defer func() {
+		stopLifecycleCancel()
+		cancel()
+	}()
+	req.SetContext(requestCtx)
 	if resp != nil {
 		req.SetResult(resp)
 	}
 	res, err := req.Execute(method, url)
 	if err != nil {
+		if isTransientTransportError(err) {
+			c.resetClientIfCurrent(generation)
+		}
 		return nil, err
 	}
 
